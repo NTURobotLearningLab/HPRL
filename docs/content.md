@@ -38,6 +38,15 @@ Aiming to produce reinforcement learning (RL) policies that are human-interpreta
 
 ## Additional Experiments Results
 
+### KAREL problem set
+| ![StairClimber](./img/karel_demo/stairClimber.gif) | ![FourCorners](./img/karel_demo/fourCorners.gif) | ![TopOff](./img/karel_demo/topOff.gif) |
+|:---:|:---:|:---:|
+| ![Maze](./img/karel_demo/randomMaze.gif) | ![CleanHouse](./img/karel_demo/cleanHouse_sample0.gif) | ![Harvester](./img/karel_demo/harvester.gif) |
+
+### KAREL-HARD problem set
+| ![DoorKey](./img/karel_demo/doorkey_sample4.gif) | ![OneStroke](./img/karel_demo/onestroke.gif) |
+|:---:|:---:|
+| ![Seeder](./img/karel_demo/seeder.gif) | ![Snake](./img/karel_demo/snake.gif) |
 
 ----
 
