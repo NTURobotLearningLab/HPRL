@@ -44,7 +44,7 @@ Aiming to produce reinforcement learning (RL) policies that are human-interpreta
 | ![Maze](./img/karel_demo/randomMaze.gif) | ![CleanHouse](./img/karel_demo/cleanHouse_sample0.gif) | ![Harvester](./img/karel_demo/harvester.gif) |
 
 ### KAREL-HARD problem set
-| ![DoorKey](./img/karel_demo/doorkey_sample4.gif) | ![OneStroke](./img/karel_demo/onestroke.gif) |
+| ![DoorKey](./img/karel_demo/doorkey_sample4.gif) | ![OneStroke](./img/karel_demo/onestroke_sample0.gif) |
 |:---:|:---:|
 | ![Seeder](./img/karel_demo/seeder.gif) | ![Snake](./img/karel_demo/snake.gif) |
 
