@@ -40,8 +40,14 @@ Aiming to produce reinforcement learning (RL) policies that are human-interpreta
 
 ----
 
+## Synthesized Programs
 
-## Qualitative Results
+| Task | LEAPS || HPRL ||
+|---|---|-|---|-|
+| StairClimber | <pre style="font-size:1px">DEF run m( <br>    WHILE c( noMarkersPresent c) w( <br>        turnRight <br>        move <br>        w) <br>    WHILE c( rightIsClear c) w( <br>        turnLeft <br>        w) <br>    m)</pre> || <pre style="font-size:1px">DEF run m( <br>    WHILE c( noMarkersPresent c) w( <br>            turnRight <br>            move <br>            turnRight <br>            move <br>        w) <br>    m)</pre> ||
+| TopOff | <pre style="font-size:1px">DEF run m( <br>    WHILE c( noMarkersPresent c) w( <br>        move <br>        w) <br>    putMarker <br>    move <br>    WHILE c( not c( markersPresent c) c) w( <br>        move <br>        w)<br>    putMarker <br>    move <br>    WHILE c( not c( markersPresent c) c) w( <br>        move <br>        w) <br>    putMarker <br>    move <br>    turnRight <br>    turnRight <br>    turnRight <br>    turnRight <br>    turnRight <br>    turnRight<br>    turnRight <br>    turnRight <br>    m) || <pre style="font-size:1px">DEF run m( <br>    REPEAT R=5 r( <br>        move <br>        WHILE c( noMarkersPresent c) w( <br>            move <br>            w) <br>        putMarker <br>        r)<br>    m)</pre> ||
+| Snake | <pre style="font-size:1px">DEF run m( <br>    turnRight <br>    turnLeft <br>    pickMarker <br>    move <br>    move <br>    move <br>    WHILE c( rightIsClear c) w( <br>        turnLeft <br>        move <br>        move <br>        w) <br>    turnLeft <br>    turnLeft <br>    turnLeft <br>    turnLeft <br>    m)</pre> || <pre style="font-size:1px">DEF run m( <br>    move <br>    WHILE c( noMarkersPresent c) w( <br>        move <br>        move <br>        turnLeft <br>        w) <br>    move <br>    turnLeft <br>    m)<br>DEF run m( <br>    move <br>    WHILE c( noMarkersPresent c) w( <br>        move <br>        move <br>        turnLeft <br>        w) <br>    m)<br>DEF run m( <br>    move <br>    WHILE c( noMarkersPresent c) w( <br>        move <br>        move <br>        turnLeft <br>        w) <br>    move <br>    turnLeft <br>    m)</pre> ||
+
 
 
 ----
