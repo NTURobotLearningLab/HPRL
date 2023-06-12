@@ -42,7 +42,7 @@ Aiming to produce reinforcement learning (RL) policies that are human-interpreta
 
 <table>
 <tbody>
-  <tr style="border-bottom: none;">
+  <tr style="border-bottom: none; padding:5px">
     <td style="text-align: center">
         <img height="auto" width="100%" src="img/karel_demo/randomMaze.gif">
 	<p style="text-align: center;padding-top: 10px">Maze</p>
@@ -67,11 +67,11 @@ Aiming to produce reinforcement learning (RL) policies that are human-interpreta
 <tbody>
   <tr style="border-bottom: none;">
     <td style="text-align: center">
-        <img height="auto" width="60%" src="img/karel_demo/doorkey_sample4.gif">
+        <img height="auto" width="50%" src="img/karel_demo/doorkey_sample4.gif">
 	<p style="text-align: center;padding-top: 10px">DoorKey</p>
     </td>
     <td style="text-align: center">
-        <img height="auto" width="60%" src="img/karel_demo/oneStroke_sample0.gif">
+        <img height="auto" width="50%" src="img/karel_demo/oneStroke_sample0.gif">
 	<p style="text-align: center;padding-top: 10px">OneStroke</p>
     </td>
   </tr>
@@ -83,11 +83,11 @@ Aiming to produce reinforcement learning (RL) policies that are human-interpreta
 <tbody>
   <tr style="border-bottom: none;">
     <td style="text-align: center">
-        <img height="auto" width="60%" src="img/karel_demo/seeder.gif">
+        <img height="auto" width="50%" src="img/karel_demo/seeder.gif">
 	<p style="text-align: center;padding-top: 10px">Seeder</p>
     </td>
     <td style="text-align: center">
-        <img height="auto" width="60%" src="img/karel_demo/snake.gif">
+        <img height="auto" width="50%" src="img/karel_demo/snake.gif">
 	<p style="text-align: center;padding-top: 10px">Snake</p>
     </td>
   </tr>
