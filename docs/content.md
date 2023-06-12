@@ -104,12 +104,12 @@ Aiming to produce reinforcement learning (RL) policies that are human-interpreta
 
 ## Quantitative Results
 <img height="auto" width="150%" src="img/table1_numbers_karel.png">
-HPRL-PPO outperforms all other approaches on all tasks. Furthermore, HPRL-PPO can completely solve all the tasks in the KAREL problem set. The Best-sampled results justify the quality of the learned latent space as tasks like *StairClimber* and *Maze* can be entirely solved by one (or some) of 1000 randomly sampled programs. However, all 1000 randomly sampled programs fail on tasks that require long-term planning and exploration (e.g., *FourCorner*, *CleanHouse*, and *Harvester*), showing the limit of the simple search-based method. 
+**Overall Karel Performance**: HPRL-PPO outperforms all other approaches on all tasks. Furthermore, HPRL-PPO can completely solve all the tasks in the KAREL problem set. The Best-sampled results justify the quality of the learned latent space as tasks like *StairClimber* and *Maze* can be entirely solved by one (or some) of 1000 randomly sampled programs. However, all 1000 randomly sampled programs fail on tasks that require long-term planning and exploration (e.g., *FourCorner*, *CleanHouse*, and *Harvester*), showing the limit of the simple search-based method. 
 
 <span></span> 
 
 <img height="auto" width="60%" src="img/table2_numbers_karel_hard.png">
-HPRL-PPO outperforms other methods on *OneStroke* and *Seeder*, while all approaches perform similarly on *DoorKey*. The complexity of *OneStroke*, *Seeder*, and *Snake* makes it difficult for Best-sampled and LEAPS to find sufficiently long and complex programmatic policies that may not even exist in the learned program embedding space. In contrast, HPRL-PPO addresses this by composing a series of programs to increase the expressiveness and perplexity of the synthesized program. 
+**Overall Karel-Hard Performance**: HPRL-PPO outperforms other methods on *OneStroke* and *Seeder*, while all approaches perform similarly on *DoorKey*. The complexity of *OneStroke*, *Seeder*, and *Snake* makes it difficult for Best-sampled and LEAPS to find sufficiently long and complex programmatic policies that may not even exist in the learned program embedding space. In contrast, HPRL-PPO addresses this by composing a series of programs to increase the expressiveness and perplexity of the synthesized program. 
 
 
 ----
