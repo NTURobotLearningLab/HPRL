@@ -6,7 +6,7 @@ This directory includes code for Karel environments, which includes:
 
 ## Dataset generation
 Dataset used in the paper is generated with the following script
-```Python3
+```
 python3 generator_option_key2door.py
 ```
 ## Domain specific language
