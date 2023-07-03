@@ -35,13 +35,15 @@ pip3 install -r requirements.txt
 
 - Download dataset from [here](https://u.pcloud.link/publink/show?code=XZ2NVIVZAqHlzGwTP7XaaLezvVIwP8mJnpYk)
 
+- Unzip the file 
+
 ```bash
-CUDA_VISIBLE_DEVICES="0" python3 pretrain/trainer.py -c pretrain/cfg.py -d data/karel_dataset/ --verbose --train.batch_size 256 --num_lstm_cell_units 256 --loss.latent_loss_coef 0.1 --rl.loss.latent_rl_loss_coef 0.1 --device cuda:0 --algorithm supervisedRL --optimizer.params.lr 1e-3 --prefix LEAPS
+bash run_vae_option_L30.sh
 ```
 
 ### Stage 2: Meta-Policy Training
 ```bash
-python3 pretrain/trainer.py --configfile pretrain/cfg.py --datadir placeholder --num_lstm_cell_units 256 --algorithm CEM --net.saved_params_path weights/LEAPS/best_valid_params.ptp --save_interval 10  --rl.envs.executable.task_file tasks/test2.txt --env_task program --rl.envs.executable.task_definition program --CEM.reduction weighted_mean --CEM.population_size 8 --CEM.sigma 0.1 --CEM.exponential_reward False --reward_type dense_subsequence_match --CEM.average_score_for_solving 1.1 --CEM.use_exp_sig_decay False --CEM.elitism_rate 0.05 --max_program_len 45 --dsl.max_program_len 45  --prefix CEM --seed 12  --CEM.init_type ones
+bash run_meta_policy_new_vae_ppo_64dim.sh
 ```
 
 
