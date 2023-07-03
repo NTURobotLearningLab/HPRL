@@ -58,4 +58,4 @@ bash run_meta_policy_new_vae_ppo_64dim.sh
 ```
 
 ## Authors
-[Guan-Ting Liu](https://dannyliu15.github.io/), [En-Pei Hu](https://guapaqaq.github.io/), [Pu-Jen Cheng]("https://www.csie.ntu.edu.tw/~pjcheng/"), [Hung-Yi Lee]("https://speech.ee.ntu.edu.tw/~hylee/index.php"), [Shao-Hua Sun](https://shaohua0116.github.io/)
+[Guan-Ting Liu](https://dannyliu15.github.io/), [En-Pei Hu](https://guapaqaq.github.io/), [Pu-Jen Cheng](https://www.csie.ntu.edu.tw/~pjcheng/), [Hung-Yi Lee](https://speech.ee.ntu.edu.tw/~hylee/index.php), [Shao-Hua Sun](https://shaohua0116.github.io/)
