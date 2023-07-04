@@ -29,7 +29,7 @@ pip3 install -r requirements.txt
 
 ## Usage
 
-### LEAPS Training
+### HPRL Training
 
 ### Stage 1: Learning Program Embeddings
 
