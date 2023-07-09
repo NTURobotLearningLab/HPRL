@@ -19,7 +19,7 @@ from baselines.common.vec_env.vec_normalize import \
 
 
 from program_env_new_vae_v2 import ProgramEnv1_new_vae_v2
-from program_env_option_new_vae_v2_key2door import ProgramEnv_option_new_vae_v2 as ProgramEnv_option_new_vae_v2_key2door_fixed
+from program_env_option_new_vae_v2_key2door_fixed import ProgramEnv_option_new_vae_v2 as ProgramEnv_option_new_vae_v2_key2door_fixed
 
 from condition_env import ConditionEnvGym
 
