@@ -657,7 +657,7 @@ class KarelStateGenerator(object):
         # put 0 markers everywhere but 2 location
         #s[:, :, 5] = 1 - (np.sum(s[:, :, 6:], axis=-1) > 0) > 0
         assert np.sum(s[:, :, 6]) == 2
-        metadata = {'agent_valid_positions': None, 'door_positions': door_pos, 'key': key}
+        metadata = {'agent_valid_positions': None, 'door_positions': door_pos, 'key': key, 'target': target}
 
         return s, agent_pos[0], agent_pos[1], np.sum(s[:, :, 4]), metadata
 

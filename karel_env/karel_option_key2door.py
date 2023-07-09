@@ -527,9 +527,9 @@ class Karel_world(object):
         total_markers = np.sum(state[:,:,6:])
         error_markers = total_markers - 2
         score = 0
-        if state[5, 2, 5]: # [1, 3, 7]
+        if state[self.metadata['key'][0], self.metadata['key'][1], 5]: # [5, 2, 5]  # [1, 3, 7]
             score += 0.5
-        if state[5, 2, 5] and state[6, 6, 7]:
+        if state[self.metadata['key'][0], self.metadata['key'][1], 5] and state[self.metadata['target'][0], self.metadata['target'][1], 7]:
             score += 0.5
 
         # open the door if marker picked
