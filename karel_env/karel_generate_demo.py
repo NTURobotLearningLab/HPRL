@@ -37,6 +37,94 @@ from karel_env.generator_option import KarelStateGenerator
 
 from pygifsicle import optimize
 import imageio
+import json
+
+def obs2action(obs_list):
+    last_obs = obs_list[0]
+    perception_dict = dict()
+    perception_dict = {'frontIsClear':'', 'leftIsClear':'', 'rightIsClear':'', 'markersPresent':'', 'noMarkersPresent':''}
+    action_arr = np.full((len(obs_list)-1,), -1, dtype=int)
+    perception_arr = np.zeros((len(obs_list), 5), dtype=bool)
+    action_list = ['' for _ in range(len(obs_list))]
+    dx = [-1, 0, 1, 0]
+    dy = [0, 1, 0, -1]
+    for l in range(1, len(obs_list)+1):
+        if l < len(obs_list):
+            current_obs = obs_list[l]
+        # print(last_obs[:, :, 6])
+        # print(current_obs[:, :, 6])
+        for i in range(1, config['input_height'] - 1):
+            for j in range(1, config['input_width'] - 1):
+                for k in range(4):
+                    if last_obs[i][j][k]:
+                        if last_obs[i+dx[k]][j+dy[k]][4]:
+                            # perception_dict['frontIsClear'].append('False')
+                            perception_dict['frontIsClear'] += '0'
+                        else:
+                            # perception_dict['frontIsClear'].append('True')
+                            perception_dict['frontIsClear'] += '1'
+                            perception_arr[l-1][0] = 1
+                        if last_obs[i+dx[(k+1)%4]][j+dy[(k+1)%4]][4]:
+                            # perception_dict['rightIsClear'].append('False')
+                            perception_dict['rightIsClear'] += '0'
+                        else:
+                            # perception_dict['rightIsClear'].append('True')
+                            perception_dict['rightIsClear'] += '1'
+                            perception_arr[l-1][2] = 1
+                        if last_obs[i+dx[(k+3)%4]][j+dy[(k+3)%4]][4]:
+                            # perception_dict['leftIsClear'].append('False')
+                            perception_dict['leftIsClear'] += '0'
+                        else:
+                            # perception_dict['leftIsClear'].append('True')
+                            perception_dict['leftIsClear'] += '1'
+                            perception_arr[l-1][1] = 1
+                        if last_obs[i][j][6] or last_obs[i][j][7]:
+                            # perception_dict['markerPresent'].append('False')
+                            perception_dict['markersPresent'] += '1'
+                            perception_dict['noMarkersPresent'] += '0'
+                            perception_arr[l-1][3] = 1
+                        else:
+                            # perception_dict['markerPresent'].append('True')
+                            perception_dict['markersPresent'] += '0'
+                            perception_dict['noMarkersPresent'] += '1'
+                            perception_arr[l-1][4] = 1
+                        
+                        if l < len(obs_list):
+                            if all(x == 0 for x in current_obs[i][j][:4]):
+                                action_list[l-1] = 'move'
+                                action_arr[l-1] = 0
+                            else:
+                                if current_obs[i][j][(k+1)%4]:
+                                    action_list[l-1] = 'turnRight'
+                                    action_arr[l-1] = 2
+                                elif current_obs[i][j][(k+3)%4]:
+                                    action_list[l-1] = 'turnLeft'
+                                    action_arr[l-1] = 1
+                                elif current_obs[i][j][(k+2)%4]:
+                                    action_list[l-1] = 'move'
+                                    action_arr[l-1] = 0
+
+                if l < len(obs_list) and action_arr[l-1] == -1:
+                    if (last_obs[i][j][6] and not current_obs[i][j][6] and not current_obs[i][j][7]) or (last_obs[i][j][7] and not current_obs[i][j][7]):
+                            action_list[l-1] = 'pickMarker'
+                            action_arr[l-1] = 4
+                    if (not last_obs[i][j][6] and not last_obs[i][j][7] and current_obs[i][j][6]) or (not last_obs[i][j][7] and current_obs[i][j][7]):
+                            action_list[l-1] = 'putMarker'
+                            action_arr[l-1] = 3
+        
+        if l < len(obs_list):
+            last_obs = current_obs
+            # if action_arr[l-1] == -1:
+            #     print(l)
+            #     raise RuntimeError(f"Action {l} is wrong.")
+    action_list[-1] = 'end'
+
+    print(len(obs_list))
+    print(len(action_list))
+    print(len(perception_dict['leftIsClear']))
+
+    return action_list.copy(), perception_dict.copy(), action_arr.copy(), perception_arr.copy()
+
 
 def run(config, logger):
 
@@ -121,6 +209,7 @@ def run(config, logger):
     rewards = float(0)
     obs = envs.reset()
     for i in range(config['num_demo']):
+        exec_dict = dict()
         for j in range(config['max_episode_steps']):
             program_str = open(config['program_file']).readlines()[j].strip()
             if i == 0:
@@ -135,6 +224,22 @@ def run(config, logger):
             # if j == config['num_step'] - 1:
                 logger.debug('Sample {} : {}'.format(i, infos[0]['episode']['r']))
                 rewards += float(infos[0]['episode']['r'])
+
+                exec_dict['s_h'] = np.array(infos[0]['exec_data']['s_image_h_list'])
+                exec_dict['s_h_len'] = exec_dict['s_h'].shape[0]
+                _, _, _, exec_dict['perception_arr'] = obs2action(exec_dict['s_h'])
+                exec_dict['action_arr'] = np.array(infos[0]['exec_data']['a_image_h_list'])
+
+                print(exec_dict)
+                print(exec_dict['s_h'].shape)
+                print(exec_dict['action_arr'].shape)
+                print(exec_dict['perception_arr'].shape)
+                with open(os.path.join(config['outdir'], "{}_sample{}.json".format(config['env_task'], i)), "w") as outfile:
+                    exec_dict['s_h'] = str(exec_dict['s_h'])
+                    exec_dict['action_arr'] = str(exec_dict['action_arr'])
+                    exec_dict['perception_arr'] = str(exec_dict['perception_arr'])
+                    json.dump(exec_dict, outfile)
+                
                 save_video_path = os.path.join(config['outdir'], "{}_sample{}.gif".format(config['env_task'], i))
                 save_last_state_image_path = os.path.join(config['outdir'], "{}_sample{}.png".format(config['env_task'], i))
                 save_gif(save_video_path, infos[0]['exec_data']['s_image_h_list'], save_last_state_image_path)

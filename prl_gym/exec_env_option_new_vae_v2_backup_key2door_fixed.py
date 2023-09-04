@@ -358,11 +358,12 @@ class ExecEnv1(ExecEnv):
                 exe_result_len = len(self._world.s_h)
                 exe_result = np.stack(self._world.s_h)
                 
+                
                 if self.pred_demo_length[k] + (exe_result_len - 1) < self.max_pred_demo_length:
                     self.pred_demo[k][self.pred_demo_length[k] : self.pred_demo_length[k] + (exe_result_len - 1)] = exe_result[1:]
                     self.pred_demo_length[k] += (exe_result_len - 1) # init state is repeated
                 #else:
-                #    print("Warning: pred_demo_length > max_pred_demo_length")
+                #    print("Warning: pred_demo_length > max_pred_demo_length") 
 
                 #demo_correctness[k] = (demo_len[k] == exe_result_len and np.all(demo[k][:demo_len[k]] == exe_result))
                 demo_correctness[k] = (demo_len[k] == self.pred_demo_length[k] and np.all(demo[k][:demo_len[k]] == self.pred_demo[k][:self.pred_demo_length[k]]))
@@ -539,6 +540,7 @@ class ExecEnv_option(ExecEnv):
         self.h, self.w, self.c = self._world.s_h[0].shape
         self.program_str_history = []
         self.s_image_h_list = []
+        self.a_image_h_list = []
         self.primitive_s_h_len = 0
         self.primitive_a_h_len = 0
         self.primitive_r_h_len = 0
@@ -626,8 +628,14 @@ class ExecEnv_option(ExecEnv):
             pred_program['reward_h'] = r_h_list
 
         # create state image
-        for s in pred_program['s_h']:
-            self.s_image_h_list.append(s)
+        if len(self.s_image_h_list) == 0:
+            for s in pred_program['s_h']:
+                self.s_image_h_list.append(s)
+        else:
+            for s in pred_program['s_h'][1:]:
+                self.s_image_h_list.append(s)
+        for a in pred_program['a_h']:
+            self.a_image_h_list.append(a)
 
         # save the state
         #self.current_state = self._world.s.copy()
@@ -636,6 +644,7 @@ class ExecEnv_option(ExecEnv):
         pred_program['done'] = self._world.done
         pred_program['program_str_history'] = self.program_str_history
         pred_program['s_image_h_list'] = self.s_image_h_list
+        pred_program['a_image_h_list'] = self.a_image_h_list
         pred_program['program_step'] = self.program_step
         pred_program['primitive_episode_len'] = self.primitive_a_h_len
         pred_program['program_syntax'] = 'correct' if syntax else 'wrong'
@@ -646,7 +655,6 @@ class ExecEnv_option(ExecEnv):
                 # print("len_r_h[0] == 0, program: ", program_str)
         else:
             pred_program['mean_reward'] = np.sum(pred_program['reward_h'])
-
 
         return pred_program
 
@@ -666,6 +674,7 @@ class ExecEnv_option(ExecEnv):
         self.h, self.w, self.c = self._world.s_h[0].shape
         self.program_str_history = []
         self.s_image_h_list = []
+        self.a_image_h_list = []
         self.program_step = 0
         #self._world.print_state()
         self.primitive_s_h_len = 0
