@@ -47,6 +47,13 @@ bash run_meta_policy_new_vae_ppo_64dim.sh
 ```
 
 
+## Troubleshooting
+- Fix `ERROR: Cannot uninstall 'certifi'.` when executing `pip3 install -r requirements.txt`  
+  ```bash
+  pip3 install --ignore-installed certifi -r requirements
+  ```
+
+
 ## Cite the paper
 ```
 @inproceedings{liu2023hierarchical, 
