@@ -10,8 +10,7 @@ h5py
 pandas
 colorlog
 progressbar
-torch==1.4.0
-torchvision==0.5.0
+torch==1.9.1
 graphviz==0.19.1
 pygifsicle==1.0.7
 scipy==1.5.4
