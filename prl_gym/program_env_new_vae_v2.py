@@ -144,10 +144,18 @@ class ProgramEnv1_new_vae_v2(ProgramEnv_new_vae_v2):
 
         return self.initial_obv, reward, done, info
 
-    def reset(self):
-        # Reset the state of the environment to an initial state
+    def reset(self, **kwargs):
+        """Reset the environment; gracefully handle a 'seed=...' argument."""
+        seed = kwargs.get('seed', None)
+        if seed is not None:
+            # If you want to set the random seed for your environment:
+            np.random.seed(seed)
+            # or do a more thorough seeding, e.g. self.np_random, _ = gym.utils.seeding.np_random(seed)
+        
         self._elapsed_steps = 0
         self.partial_program = []
         self.state = self.initial_obv
         self.task_env.reset()
+
+        # Return the single observation so older baselines code won't break
         return self.state

@@ -9,6 +9,9 @@ import progressbar
 import random
 import pickle
 import numpy as np
+import sys
+
+sys.path.insert(0, 'karel_env')
 
 from dsl import get_DSL_option_v2
 from dsl.dsl_parse_and_trace import parse_and_trace

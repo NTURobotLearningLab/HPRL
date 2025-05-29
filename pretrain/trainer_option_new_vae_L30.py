@@ -16,6 +16,8 @@ import errno
 import h5py
 from tqdm import tqdm
 
+import wandb
+
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
@@ -30,6 +32,7 @@ from pretrain.SupervisedModel_option_new_vae import SupervisedModel
 from pretrain.ppo_trainer_new_vae import PPOModel
 from pretrain.sac_trainer_new_vae import SACModel
 from pretrain.misc_utils import log_record_dict, create_directory
+from pretrain.utils import convert_to_POMDP, convert_to_POMDP_np
 from fetch_mapping import fetch_mapping
 from rl.envs import make_vec_envs
 from rl import utils
@@ -93,50 +96,72 @@ class ProgramDataset(Dataset):
         mask[:program_len] = 1
 
         # load exec data
-        s_h, a_h, a_h_len = exec_data
+        s_h_list = []
+        s_h, partial_s_h, s_h_len, a_h, a_h_len = exec_data
         s_h = torch.tensor(s_h, device=self.device, dtype=torch.float32)
+        partial_s_h = torch.tensor(partial_s_h, device=self.device, dtype=torch.float32)
+        # print(f"s_h shape: {s_h.shape}")
+        # print(f"partial_s_h shape: {partial_s_h.shape}")
+        # from prog_policies.drl_train  import save_gif
+        # np_sh = s_h.detach().cpu().numpy()
+        # np_partial_sh = partial_s_h.detach().cpu().numpy()
+        # for i in range(10):
+        #     save_gif(os.path.join('/home/hubertchang/HPRL/pretrain/viz_data_state', f"prog{program_id}_roll{i}.gif"),  [frame for frame in np_sh[i]])
+        #     save_gif(os.path.join('/home/hubertchang/HPRL/pretrain/viz_data_state', f"prog{program_id}_roll{i}_partial.gif"),  [frame for frame in np_partial_sh[i]])
+        # print(f"prog_id:{program_id}")
+        s_h_len = torch.tensor(s_h_len, device=self.device, dtype=torch.int16)
         a_h = torch.tensor(a_h, device=self.device, dtype=torch.int16)
         a_h_len = torch.tensor(a_h_len, device=self.device, dtype=torch.int16)
 
+        packed_s_h = rnn.pack_padded_sequence(s_h, s_h_len.to("cpu"), batch_first=True, enforce_sorted=False)
+        padded_s_h, s_h_len = rnn.pad_packed_sequence(packed_s_h, batch_first=True,
+                                                      padding_value=0.0,
+                                                      total_length=self.config['max_demo_length'])
+
+        packed_partial_s_h = rnn.pack_padded_sequence(partial_s_h, s_h_len.to("cpu"), batch_first=True,
+                                                      enforce_sorted=False)
+        padded_partial_s_h, s_h_len = rnn.pad_packed_sequence(packed_partial_s_h, batch_first=True,
+                                                              padding_value=0.0,
+                                                              total_length=self.config['max_demo_length'])
         packed_a_h = rnn.pack_padded_sequence(a_h, a_h_len.to("cpu"), batch_first=True, enforce_sorted=False)
         padded_a_h, a_h_len = rnn.pad_packed_sequence(packed_a_h, batch_first=True,
                                                       padding_value=self.num_agent_actions-1,
                                                       total_length=self.config['max_demo_length'] - 1)
 
-        return sample, program_id, mask, s_h, padded_a_h, a_h_len.to(self.device)
+        s_h_list.append(padded_s_h)
+        s_h_list.append(padded_partial_s_h)
+        return sample, program_id, mask, s_h_list, s_h_len.to(self.device), padded_a_h, a_h_len.to(self.device)
 
 
 def get_exec_data(hdf5_file, program_id, num_agent_actions):
-    def func(x):
-        s_h, s_h_len = x
-        assert s_h_len > 1
-        return np.expand_dims(s_h[0], 0)
+    s_h = np.moveaxis(np.copy(hdf5_file[program_id]['s_h']), [-1, -2, -3], [-3, -1, -2])
+    # print(f"s_h shape after get_exec_data: {s_h.shape}")
+    patches, ok_mask = convert_to_POMDP_np(s_h)
+    partial_s_h = patches
 
-    s_h = np.moveaxis(np.copy(hdf5_file[program_id]['s_h']), [-1,-2,-3], [-3,-1,-2])
+    # print("shape:", patches.shape)          # (R, T, 8, 3, 3)
+    # print("frames with missing Karel:",
+        # np.where(~ok_mask))               # indices you may want to drop
     a_h = np.copy(hdf5_file[program_id]['a_h'])
     s_h_len = np.copy(hdf5_file[program_id]['s_h_len'])
     a_h_len = np.copy(hdf5_file[program_id]['a_h_len'])
 
-    # expand demo length if max_demo_len==1
+    # expand demo length if needed (only for 1-timestep demos)
     if s_h.shape[1] == 1:
-        s_h = np.concatenate((np.copy(s_h), np.copy(s_h)), axis=1)
-        #print("a_h shape: ", a_h.shape)
+        s_h = np.concatenate((s_h, s_h), axis=1)
         a_h = np.ones((s_h.shape[0], 1))
 
-    # Add no-op actions for empty demonstrations
+    # Add dummy actions for demos with a_h_len == 0
     for i in range(s_h_len.shape[0]):
         if a_h_len[i] == 0:
             assert s_h_len[i] == 1
             a_h_len[i] += 1
             s_h_len[i] += 1
-            s_h[i][1, :, :, :] = s_h[i][0, :, :, :]
+            s_h[i][1] = s_h[i][0]
             a_h[i][0] = num_agent_actions - 1
 
-    # select input state from demonstration executions
-    results = map(func, zip(s_h, s_h_len))
+    return s_h, partial_s_h, s_h_len, a_h, a_h_len
 
-    s_h = np.stack(list(results))
-    return s_h, a_h, a_h_len
 
 def make_datasets(datadir, config, num_program_tokens, num_agent_actions, device, logger, dsl):
     """ Given the path to main dataset, split the data into train, valid, test and create respective pytorch Datasets
@@ -367,7 +392,11 @@ def _temp(config, args):
     args.execution_guided = config['rl']['policy']['execution_guided']
 
 if __name__ == "__main__":
-    
+    # wandb_project_name = input("Please enter the wandb project name: ")
+    from cfg_option_new_vae import config
+    wandb_session_name = input("Please enter the wandb session name: ")
+    wandb.init(project="DRLGS_latent", name=wandb_session_name, config=config)
+
     #torch.set_num_threads(2)
     torch.set_num_threads(1)
 

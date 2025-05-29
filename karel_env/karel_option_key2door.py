@@ -313,6 +313,82 @@ class Karel_world(object):
         self.done = self.done or done
         return reward, done
 
+    def _get_stairClimber_task_reward_v2(self, agent_pos):
+        assert self.reward_diff is True
+
+        if self.done:
+            return 0.0, self.done
+
+        # Get marker position from initial state
+        init_state = self.s_h[0]
+        x, y = np.where(init_state[:, :, 6] > 0)
+        assert len(x) == 1, f"{len(x)} markers found!"
+        marker_pos = np.asarray([x[0], y[0]])
+
+        # Get initial agent position
+        x, y, z = np.where(self.s_h[0][:, :, :4] > 0)
+        init_agent_pos = np.asarray([x[0], y[0], z[0]])
+        max_distance = spatial.distance.cityblock(init_agent_pos[:2], marker_pos)
+        assert max_distance > 0
+
+        # On first step, set initial prev_pos_reward
+        if len(self.s_h) == 2 or not hasattr(self, "prev_pos_reward"):
+            self.prev_pos_reward = -spatial.distance.cityblock(init_agent_pos[:2], marker_pos)
+
+        # Current distance to goal
+        current_distance = -spatial.distance.cityblock(agent_pos[:2], marker_pos)
+
+        # Reward = improvement in distance (normalized)
+        reward = (current_distance - self.prev_pos_reward) / max_distance
+        self.prev_pos_reward = current_distance
+
+        # Penalty for invalid position
+        if tuple(agent_pos[:2]) not in self.metadata['agent_valid_positions']:
+            reward -= 1.0
+
+        # Done if exactly at marker
+        done = current_distance == 0
+        self.done = self.done or done
+
+        # Optional: zero reward unless success if sparse
+        if self.env_task == 'stairClimber_sparse':
+            reward = reward if done and not self.done else 0.0
+
+        return reward, done
+
+    # def _get_stairClimber_task_reward_v3(self, agent_pos):
+    #     terminated = False
+    #     reward = 0.
+
+    #     init_state = self.s_h[0]
+    #     x, y = np.where(init_state[:, :, 6] > 0)
+    #     assert len(x) == 1, f"{len(x)} markers found!"
+    #     marker_pos = np.asarray([x[0], y[0]])
+
+    #     karel_pos = agent_pos[:2]
+    #     initial_distance = abs(karel_pos[0] - marker_pos[0]) \
+    #         + abs(karel_pos[1] - marker_pos[1])
+        
+    #     current_distance = abs(karel_pos[0] - marker_pos[0]) \
+    #         + abs(karel_pos[1] - marker_pos[1])
+        
+    #     # Reward is how much closer Karel is to the marker, normalized by the initial distance
+    #     reward = (previous_distance - current_distance) / initial_distance
+        
+    #     if [karel_pos[0], karel_pos[1]] not in self.metadata['agent_valid_positions']:
+    #         reward = -0.1
+    #         terminated = True
+            
+    #     if karel_pos[0] == marker_pos[0] and karel_pos[1] == marker_pos[1]:
+    #         terminated = True
+        
+    #     previous_distance = current_distance
+        
+    #     return reward, terminated
+        
+
+        
+
     def _get_topOff_task_reward(self, agent_pos):
         # check if already done
         if self.done:
@@ -621,7 +697,7 @@ class Karel_world(object):
         elif self.env_task == 'randomMaze' or self.env_task == 'randomMaze_sparse':
             reward, done = self._get_randomMaze_task_reward(agent_pos)
         elif self.env_task == 'stairClimber' or self.env_task == 'stairClimber_sparse':
-            reward, done = self._get_stairClimber_task_reward(agent_pos)
+            reward, done = self._get_stairClimber_task_reward_v2(agent_pos)
         elif self.env_task == 'topOff' or self.env_task == 'topOff_sparse':
             reward, done = self._get_topOff_task_reward(agent_pos)
         elif self.env_task == 'randomMaze_key2door' or self.env_task == 'randomMaze_key2door_sparse': 

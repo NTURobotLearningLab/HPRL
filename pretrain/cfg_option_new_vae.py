@@ -24,28 +24,39 @@ config = {
         'saved_params_path': None,                  # path to load saved weights in a loaded network
         'saved_sup_params_path': None,              # path to load saved weights from supervised training
         'rnn_type': 'GRU',                          # recurrent unit type
-        'dropout': 0.0,                             # dropout rate for recurrent unit
+        'dropout': 0.05,                             # dropout rate for recurrent unit
         'latent_std_mu': 0.0,                       # latent mu for program embedding distribution
         'latent_std_sigma': 0.1,                    # latent sigma for program embedding distribution
+        'bz_latent_std_mu': 0.0,                        # bz mu for behavior embedding distribution
+        'bz_latent_std_sigma': 0.1,                     # bz sigma for behavior embedding distribution
         'latent_mean_pooling': False,                # mean pooling over hn in each time step 
         'decoder': {
             'use_teacher_enforcing': True,          # teacher enforcing while SL training
             'freeze_params': False                  # freeze decoder params if set True
         },
-        'use_linear': True,
+        'use_linear': False,
         'num_rnn_encoder_units': 256,
         'num_rnn_decoder_units': 256,
         'use_transformer_encoder': False,
         'use_transformer_decoder': False,
+        'use_transformer_encoder_behavior': True,   # use transformer for behavior encoding instead of RNN
+        'use_transformer_decoder_behavior': True,   # use transformer for behavior encoding instead of RNN
+        'transformer_layers': 4,                    # number of transformer layers for behavior encoder
+        'transformer_heads': 4,                     # number of attention heads for behavior encoder
+        'transformer_decoder_layers': 4,
+        'transformer_decoder_heads': 4,
         'transformer': {                            # transformer unit setting
-            'd_word_vec': 32,                       # dimension of word embedding
-            'd_k': 4,
-            'd_v': 4,
+            'd_word_vec': 128,                       # dimension of word embedding
+            'd_k': 32,
+            'd_v': 32,
             'n_layers': 3,
             'n_head': 4,
             'd_inner': 512,                         # inner unit size for ffn
-            'dropout': 0.1,
+            'dropout': 0,
             'method': 'Autobot',                    # 'Autobot' or 'MeanPooling'
+        },
+        'behavior_encoder':{
+            'rollout_distill_method': 'mean',       # How to distill 10 rollout vectors into one vector
         },
         'condition':{
             'freeze_params': False,
@@ -75,15 +86,19 @@ config = {
     'seed': 123,
 
     'optimizer': {
-        'name': 'adam',
+        'name': 'adamw',
         'params': {
-            'lr': 5e-4,
+            'lr': 3e-4,
+            'weight_decay': 1e-2,
+            'betas': (0.9, 0.999),
         },
         'scheduler': {
-            'step_size': 10,                        # Period of learning rate decay
-            'gamma': .95,                           # Multiplicative factor of learning rate decay
+            'name' : 'cosine',
+            'T_max': 50,          # epochs to one full cosine cycle
+            'eta_min': 1e-6,      # min LR
         }
     },
+
 
     # config to control training
     'train': {
@@ -91,7 +106,7 @@ config = {
             'to_tensor': True,
             'use_pickled': True
         },
-        'batch_size': 256,
+        'batch_size': 64,
         'shuffle': True,
         'max_epoch': 100,
     },
@@ -101,7 +116,7 @@ config = {
             'to_tensor': True,
             'use_pickled': True
         },
-        'batch_size': 256,
+        'batch_size': 64,
         'shuffle': True,
         'debug_samples': [3, 37, 54],               # sample ids to generate plots for (None, int, list)
     },
@@ -111,20 +126,16 @@ config = {
             'to_tensor': True,
             'use_pickled': True
         },
-        'batch_size': 256,
+        'batch_size': 64,
         'shuffle': True,
     },
     # config to control evaluation
     'eval': {
         'usage': 'test',                            # what dataset to use {train, valid, test}
     },
-    'loss': {
-        'latent_loss_coef': 1.0,                    # coefficient of latent loss (beta) in VAE during SL training
-        'condition_loss_coef': 1.0,                 # coefficient of condition policy loss during SL training
-    },
     'dsl': {
         'use_simplified_dsl': False,                # reducing valid tokens from 50 to 31
-        'max_program_len': 12, #45,                 # maximum program length
+        'max_program_len': 45, #45,                 # maximum program length
         'grammar': 'handwritten',                   # grammar type: [None, 'handwritten']
     },
     'rl':{
@@ -316,7 +327,7 @@ config = {
     'env_task': 'program',                          # VAE: program,  meta-policy: cleanHouse, harvester, fourCorners, randomMaze, stairClimber, topOff
     'reward_diff': True,                            # If True, differnce between rewards of two consecutive states will be considered at each env step, otherwise current environment reward will be considered
     'prefix': 'default',                            # output directory prefix
-    'max_program_len': 12, #45,                     # maximum program length  (repeated)
+    'max_program_len': 45, #45,                     # maximum program length  (repeated)
     'mapping_file': None,                           # mapping_karel2prl.txt if using simplified DSL (Ignore of intention space)
     'debug': False,                                 # use this to debug RL code (provides a lot of debug data in form of dict)
     'input_height': 8,                              # height of state image
@@ -341,5 +352,34 @@ config = {
     'grammar':'handwritten',                        # grammar type: [None, 'handwritten']
     'use_trainable_tensor': False,                  # If True, use trainable tensor instead of meta-controller
     'cover_all_branches_in_demos': True,            # If True, make sure to cover all branches in randomly generated program in ExecEnv1
-    'final_reward_scale': False
+    'final_reward_scale': False,
+
+    'behavior_representation': 'action_sequence',    # 'state_sequence', 'action_sequence'
+    'encode_method': 'concat_sasa',                        #'prepend_s0', 'fuse_s0', 'sasa', 'concat_sasa'                    
+    'loss': {
+        'z_latent_loss_coef': 1.0,                    # coefficient of latent loss (beta) in VAE during SL training
+        'bz_latent_loss_coef': 1.0,                   # coefficient of bz latent loss (beta) in VAE during SL training
+        'condition_loss_coef': 1.0,                 # coefficient of condition policy loss during SL training
+        'b_z_rec_loss_coef': 1.0,                # coefficient of b_z_rec loss in VAE during SL training
+        'z_rec_loss_coef': 1.0,                    # coefficient of z_rec loss in VAE during SL training
+        'b_z_condition_loss_coef': 1.0,            # coefficient of b_z_condition loss in VAE during SL training
+        'z_condition_loss_coef': 1.0,              # coefficient of z_condition loss in VAE during SL training
+        'contrastive_loss_coef': 1.0,               # coefficient of contrastive loss in VAE during SL training
+        'clip_loss_coef': 1.0,                     # coefficient of clip loss in VAE during SL training
+        'enabled_losses': {
+            'z_rec': True,
+            'b_z_rec': True,
+            'contrastive_loss': ['cosine', 'mse'],      # 'contrastive', 'clip', 'mse', 'l2', 'cosine', 'none'
+            'latent': 'separate',                  # 'combined', 'separate', 'none'   
+            'z_condition': True,
+            'b_z_condition': True,
+        },
+        'contrastive_loss_margin': 0.01,
+    },
+    'normalize_latent': False,
+    'use_bz_scalar': False,
+    'freeze_p2p': False,
+    'finetune_decoder': False,
+    'POMDP' : False,
+    'stop_teacher_enforcing': False,            # stop teacher enforcing after certain number of epochs
 }

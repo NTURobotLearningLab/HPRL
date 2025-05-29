@@ -1,0 +1,28 @@
+numpy>=1.21
+tensorboardX>=2.5
+gym>=0.26.2
+requests
+wandb>=0.15
+ply
+imageio>=2.31
+tqdm
+h5py>=3.8
+pandas>=1.5
+colorlog
+progressbar2
+torch>=2.0
+graphviz
+pygifsicle
+scipy>=1.9
+opencv-python
+
+# for Stable‑Baselines3 training script
+stable-baselines3>=1.8.0
+sb3-contrib
+pyyaml>=6.0
+imageio
+imageio[ffmpeg]
+pillow<10.1.0
+
+# torchtune
+scikit-learn

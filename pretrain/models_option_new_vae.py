@@ -7,6 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 from torch.autograd import Variable
+from torch.utils.checkpoint import checkpoint
 import gym
 
 from karel_env.tool.syntax_checker import PySyntaxChecker
@@ -46,10 +47,567 @@ class Normal(nn.Module):
     def forward(self, mean, std):
         return FixedNormal(mean, std)
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
+from torch.autograd import Variable
 
-class Encoder(NNBase):
+# For RoPE
+# from torchtune.modules import RotaryPositionalEmbeddings
+
+from rl.model_option import NNBase
+from rl.utils import init
+
+class ActionBehaviorEncoder(NNBase):
+    def __init__(
+        self,
+        recurrent,
+        num_actions,
+        hidden_size=64,
+        rnn_type='GRU',
+        dropout=0.0,
+        use_linear=False,
+        unit_size=256,
+        **kwargs
+    ):
+        """
+        Encodes a rollout of actions (only) into a single latent vector per rollout.
+
+        :param num_actions: how many possible actions exist (for embedding).
+        :param hidden_size: final output dimension (matching ProgramEncoder).
+        :param rnn_type: 'GRU' or 'LSTM'.
+        :param dropout: dropout on the RNN.
+        :param use_linear: if True, project from `unit_size` down to `hidden_size`.
+        :param unit_size: internal dimension for the RNN and/or embedding.
+        """
+        # We set recurrent=True so NNBase will handle RNN init for us
+        super(ActionBehaviorEncoder, self).__init__(
+            recurrent=True,
+            recurrent_input_size=unit_size,   # dimension fed into the RNN
+            hidden_size=unit_size,  # RNN’s hidden dimension
+            dropout=dropout,
+            rnn_type=rnn_type
+        )
+
+        # Same style init as ConditionPolicy, etc.
+        init_ = lambda m: init(
+            m,
+            nn.init.orthogonal_,
+            lambda x: nn.init.constant_(x, 0),
+            nn.init.calculate_gain('relu')
+        )
+
+        self.num_actions = num_actions
+        self.hidden_size = hidden_size
+        self.rnn_type = rnn_type
+        self._use_linear = use_linear
+        self.unit_size = unit_size
+        self.state_shape = (kwargs['input_channel'], kwargs['input_height'], kwargs['input_width'])
+        self.encode_method = kwargs['encode_method']
+        # 1) Action embedding: each action ID → (unit_size)
+        self.action_encoder = nn.Embedding(num_actions, unit_size)
+
+        # 2) Optional projection from `unit_size` → `hidden_size`
+        if use_linear:
+            self.proj = nn.Linear(unit_size, hidden_size)
+
+        # 3) State Embedding
+        self.state_encoder = nn.Sequential(
+            init_(nn.Conv2d(self.state_shape[0], 32, 3, stride=1)), nn.ReLU(),
+            init_(nn.Conv2d(32, 32, 3, stride=1)), nn.ReLU(), Flatten(),
+            init_(nn.Linear(32 * 4 * 4, hidden_size)), nn.ReLU())
+        
+        self.state_projector = nn.Linear(hidden_size, unit_size)
+
+        # project 72 to 64
+        self.POMDP_state_projector = nn.Linear(72, unit_size)
+
+
+
+    def forward(self, s_h, a_h, s_h_len, a_h_len):
+        """
+        :param 
+            s_h: shape (B, R, T, C, H, W), initial state of the environment.
+            a_h: shape (B, R, T), each entry is an action ID.
+        :return: shape (B, R, out_dim), where out_dim = hidden_size or unit_size
+        """
+        # Action sequence processing
+        B, R, T = a_h.shape
+        B_rolled = B * R
+        a_h_flat = a_h.view(B_rolled, T).long()
+        a_h_len_flat = a_h_len.view(B_rolled)
+
+        embedded_actions = self.action_encoder(a_h_flat)  # [B*R, T, unit_size]
+
+        # Extract initial state image
+        s_0 = s_h[:, :, 0, :, :, :]  # (B, R, C, H, W)
+        B, R, C, H, W = s_0.shape
+        T += 1 #state has T+1 time steps
+        BRT = B * R * T 
+
+        s_0 = s_0.view(B_rolled, C, H, W)
+        s0_embed = self.state_encoder(s_0)  # [B*R, hidden_size]
+        s0_embed = self.state_projector(s0_embed)  # [B*R, unit_size]
+
+        flat_sh = s_h.view(BRT, C, H, W)  # [B*R*T, C, H, W]
+        s_embed = self.state_encoder(flat_sh)  # [B*R*T, hidden_size]
+        s_embed = self.state_projector(s_embed)  # [B*R*T, unit_size]
+        s_embed = s_embed.view(B_rolled, T, self.unit_size)  # [B*R, T, unit_size]
+
+        
+
+        if self.encode_method == 'fuse_s0':
+            embedded_s_a = embedded_actions  # no s_0 prepended
+            embedded_lengths = a_h_len_flat
+        elif self.encode_method == 'prepend_s0':
+            projected_s_0 = s0_embed.unsqueeze(1)  # [B*R, 1, unit_size]
+            embedded_s_a = torch.cat((projected_s_0, embedded_actions), dim=1)
+            embedded_lengths = a_h_len_flat + 1
+        elif self.encode_method == 'sasa':
+            # interleave s_embed and embedded_actions
+            embedded_s_a = torch.zeros(B_rolled, 2*T-1, self.unit_size, device=s_embed.device)
+            embedded_s_a[:, 0::2, :] = s_embed
+            embedded_s_a[:, 1::2, :] = embedded_actions
+            embedded_lengths = a_h_len_flat * 2 + 1
+
+
+
+        # Pack and RNN
+        packed_s_a = nn.utils.rnn.pack_padded_sequence(
+            embedded_s_a, embedded_lengths.to("cpu"), batch_first=True, enforce_sorted=False
+        )
+
+        if self.rnn_type.upper() == 'GRU':
+            packed_outputs, rnn_hxs = self.gru(packed_s_a)
+        else:
+            packed_outputs, (h_n, c_n) = self.lstm(packed_s_a)
+            rnn_hxs = h_n
+
+        final_hidden = rnn_hxs[-1]  # [B*R, unit_size]
+        # Fuse with s_0 after RNN if enabled
+        if self.encode_method == 'fuse_s0':
+            # You can either add or concat — here we concat and project
+            fused = final_hidden + s0_embed  # [B*R, unit_size]
+            final_hidden = fused
+
+        # Optional projection
+        if self._use_linear:
+            final_hidden = self.proj(final_hidden)  # [B*R, hidden_size]
+            out_dim = self.hidden_size
+        else:
+            out_dim = self.unit_size
+
+
+
+        final_hidden = final_hidden.view(B, R, out_dim)  # [B, R, out_dim]
+        behavior_embedding = final_hidden.mean(dim=1)  # [B, out_dim]
+
+        return behavior_embedding
+
+
+class ActionBehaviorEncoderTransformer(ActionBehaviorEncoder):
+    def __init__(
+        self,
+        recurrent,
+        num_actions,
+        hidden_size=64,
+        rnn_type='GRU',
+        dropout=0.0,
+        use_linear=False,
+        unit_size=256,
+        **kwargs
+    ):
+        """
+        Transformer-based encoder for action sequences.
+        
+        This class extends ActionBehaviorEncoder but replaces the RNN with a Transformer.
+        """
+        # Initialize the parent class without recurrent=True
+        super(ActionBehaviorEncoderTransformer, self).__init__(
+            recurrent=False,  # We'll use transformer instead
+            num_actions=num_actions,
+            hidden_size=hidden_size,
+            rnn_type=rnn_type,
+            dropout=dropout,
+            use_linear=use_linear,
+            unit_size=unit_size,
+            **kwargs
+        )
+        
+        # Get transformer parameters from kwargs with defaults
+        self.fuse_s_0 = (kwargs['encode_method'] == 'fuse_s0')
+        self.num_layers = kwargs['net']['transformer_layers']
+        self.num_heads = kwargs['net']['transformer_heads']
+        self.causal_attn = kwargs.get('causal_attention', True)
+        
+        # end-of-sentence
+        self.eos_token = nn.Parameter(torch.zeros(1, 1, unit_size))
+        nn.init.normal_(self.eos_token, std=0.02)
+
+        # separator token between rollouts
+        self.sep_token = nn.Parameter(torch.zeros(1, 1, unit_size))
+        nn.init.normal_(self.sep_token, std=0.02)
+        
+        # Layer norm before transformer
+        self.pre_transformer_ln = nn.LayerNorm(unit_size)
+        
+        # Create transformer encoder layer
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=unit_size,
+            nhead=self.num_heads,
+            dim_feedforward=unit_size*4,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True
+        )
+        
+        self.transformer_encoder = nn.TransformerEncoder(
+            encoder_layer, 
+            num_layers=self.num_layers
+        )
+        
+        self.final_ln = nn.LayerNorm(unit_size)
+        
+        if use_linear:
+            self.proj = nn.Linear(unit_size, hidden_size)
+
+        self.POMDP = kwargs['POMDP']
+
+    def forward(self, s_h, a_h, s_h_len, a_h_len):
+        """
+        Encode a sequence of actions using a causal transformer with EOS token.
+        
+        :param s_h: shape (B, R, T, C, H, W) — B = programs, R = rollouts, T = time
+        :param a_h: shape (B, R, T), each entry is an action ID
+        :param s_h_len: sequence lengths for each rollout, shape (B, R)
+        :param a_h_len: action sequence lengths, shape (B, R)
+        :return: shape (B, out_dim), aggregated behavior embedding
+        """
+        # Initial state processing (similar to parent class)
+        s_0 = s_h[:, :, 0, :, :, :]  # (B, R, T, C, H, W)
+        B, R, C, H, W = s_0.shape
+        B_rolled = B * R
+        device = s_h.device
+
+        new_s0 = s_0.view(B_rolled, C, H, W)
+        if not self.POMDP:
+            state_embeddings = self.state_encoder(new_s0)  # [B*R, hidden_size]
+            state_embed = self.state_projector(state_embeddings)  # [B*R, unit_size]
+        # Action sequence processing
+        B, R, T = a_h.shape
+        a_h_flat = a_h.view(B_rolled, T).long()
+        a_h_len_flat = a_h_len.view(B_rolled)
+
+
+        embedded_actions = self.action_encoder(a_h_flat)  # [B*R, T, unit_size]
+
+        T += 1 
+        BRT = B * R * T
+        flat_sh = s_h.view(BRT, C, H, W)  # [B*R*T, C, H, W]
+        if not self.POMDP:
+            s_embed = self.state_encoder(flat_sh)  # [B*R*T, hidden_size]
+            s_embed = self.state_projector(s_embed)  # [B*R*T, unit_size]
+        else:
+            flat_sh = flat_sh.view(BRT, C*H*W)  # [B*R*T, 72]
+            s_embed = self.POMDP_state_projector(flat_sh)
+        s_embed = s_embed.view(B_rolled, T, self.unit_size)  # [B*R, T, unit_size]
+        
+        # Handle state fusion
+        if self.encode_method == 'fuse_s0':
+            # Add +1 to make room for EOS token in all cases
+            seq_len_T = T + 1
+            # Create input with extra position for EOS
+            transformer_input = torch.zeros(B_rolled, seq_len_T, self.unit_size, device=device)
+            transformer_input[:, :T, :] = embedded_actions  # Place actions in first T positions
+            seq_lengths = a_h_len_flat
+        elif self.encode_method == 'concat_sasa':
+            B, R, T = a_h.shape
+            B_rolled = B * R
+            device = s_embed.device
+            unit_size = self.unit_size
+            T += 1
+
+            # Interleave S A S A ... to get (B*R, 2T-1, unit_size)
+            embedded_s_a = torch.zeros(B_rolled, 2*T - 1, unit_size, device=device)
+            embedded_s_a[:, 0::2, :] = s_embed
+            embedded_s_a[:, 1::2, :] = embedded_actions
+
+            # Actual lengths per rollout
+            rollout_lengths = a_h_len_flat * 2 + 1  # shape: (B*R,)
+            rollout_chunks = []
+            batch_sep_token = self.sep_token.squeeze(0).squeeze(0)  # [unit_size]
+            batch_eos_token = self.eos_token.squeeze(0).squeeze(0)  # [unit_size]
+
+            max_seq_len = 0
+            batch_sequences = []
+
+            for b in range(B):
+                # collect R rollouts for batch b
+                rollout_seq = []
+                total_len = 0
+                for r in range(R):
+                    idx = b * R + r
+                    r_len = rollout_lengths[idx].item()
+                    sas = embedded_s_a[idx, :r_len, :]  # (r_len, unit_size)
+                    rollout_seq.append(sas)
+                    total_len += r_len
+                    if r != R - 1:
+                        # Add sep_token between rollouts
+                        rollout_seq.append(batch_sep_token.unsqueeze(0))  # (1, unit_size)
+                        total_len += 1
+                # After all rollouts, add EOS token
+                rollout_seq.append(batch_eos_token.unsqueeze(0))  # (1, unit_size)
+                total_len += 1
+
+                full_seq = torch.cat(rollout_seq, dim=0)  # (total_len, unit_size)
+                max_seq_len = max(max_seq_len, total_len)
+                batch_sequences.append(full_seq)
+
+            # Pad to max_seq_len
+            transformer_input = torch.zeros(B, max_seq_len, unit_size, device=device)
+            padding_mask = torch.ones(B, max_seq_len, dtype=torch.bool, device=device)  # default all padding
+
+            for b, seq in enumerate(batch_sequences):
+                L = seq.shape[0]
+                transformer_input[b, :L, :] = seq
+                padding_mask[b, :L] = False  # not padding
+
+            # Apply layer norm
+            transformer_input = self.pre_transformer_ln(transformer_input)
+
+            # Generate causal mask if needed
+            causal_mask = None
+            if self.causal_attn:
+                causal_mask = torch.triu(torch.full((max_seq_len, max_seq_len), float('-inf'), device=device), diagonal=1)
+
+            # Use transformer with checkpointing
+            transformer_output = checkpoint(
+                self.transformer_encoder,
+                transformer_input,
+                causal_mask,
+                padding_mask,
+                self.causal_attn
+            )
+
+            # Layer norm again
+            transformer_output = self.final_ln(transformer_output)
+
+            # Grab embedding at EOS position (last non-padding token in each seq)
+            eos_embeddings = []
+            for b in range(B):
+                eos_pos = (~padding_mask[b]).nonzero(as_tuple=False).max().item()
+                eos_embeddings.append(transformer_output[b, eos_pos])
+
+            final_hidden = torch.stack(eos_embeddings, dim=0)  # (B, unit_size)
+
+
+            if self._use_linear:
+                final_hidden = self.proj(final_hidden)
+
+            return final_hidden  # shape (B, hidden_size or unit_size)
+
+        else:
+             # Prepend s_0 to action sequence, add +1 for EOS
+            seq_len_T = T + 2  # +1 for s_0, +1 for EOS
+            transformer_input = torch.zeros(B_rolled, seq_len_T, self.unit_size, device=device)
+            transformer_input[:, 0, :] = state_embed  # First position is state
+            transformer_input[:, 1:T+1, :] = embedded_actions  # Then actions
+            seq_lengths = a_h_len_flat + 1  # +1 for prepended state
+        
+        # Add EOS token at the end of each valid sequence
+        for i in range(B_rolled):
+            seq_len = seq_lengths[i].item()
+            # Always place EOS token right after the valid sequence
+            transformer_input[i, seq_len] = self.eos_token.squeeze(0).squeeze(0)
+
+        # Create padding mask (values to be masked = True)
+        # Everything after the EOS token should be masked
+        padding_mask = torch.arange(seq_len_T, device=device).expand(B_rolled, seq_len_T) > (seq_lengths + 1).unsqueeze(1)
+                
+        # Apply layer normalization before transformer
+        transformer_input = self.pre_transformer_ln(transformer_input)
+
+        causal_mask = None
+        if self.causal_attn:
+            causal_mask = torch.triu(torch.ones(seq_len_T, seq_len_T, device=device) * float('-inf'), diagonal=1)
+        
+        # Apply transformer encoder with native causal masking
+        # transformer_output = self.transformer_encoder(
+        #     src=transformer_input,
+        #     mask=causal_mask,
+        #     src_key_padding_mask=padding_mask,
+        #     is_causal=self.causal_attn  # Native causal masking is sufficient
+        # )  # [B*R, T, unit_size]
+        
+        transformer_output = checkpoint(
+            self.transformer_encoder,
+            transformer_input,
+            causal_mask,
+            padding_mask,
+            self.causal_attn
+        )
+        
+        # Apply final layer norm
+        transformer_output = self.final_ln(transformer_output)
+        
+        # Extract embeddings at the end of each valid sequence (including EOS)
+        sequence_embeddings = []
+        for i in range(B_rolled):
+            # Get the actual sequence length (might be shorter than T)
+            seq_len = seq_lengths[i].item()
+            # Use the EOS token position (or last valid position if no EOS)
+            seq_len = min(seq_len, T-1)  # Ensure index is valid
+            sequence_embeddings.append(transformer_output[i, seq_len])
+        
+        # Stack to get final embeddings
+        final_hidden = torch.stack(sequence_embeddings)  # [B*R, unit_size]
+        
+        # Fuse with s_0 after transformer if enabled
+        if self.fuse_s_0:
+            # Similar to the parent class, we add state_embed to final_hidden
+            fused = final_hidden + state_embed  # [B*R, unit_size]
+            final_hidden = fused
+        
+        # Optional projection: [B*R, hidden_size]
+        if self._use_linear:
+            final_hidden = self.proj(final_hidden)
+            out_dim = self.hidden_size
+        else:
+            out_dim = self.unit_size
+
+        # Reshape to [B, R, out_dim]
+        final_hidden = final_hidden.reshape(B, R, out_dim)
+        
+        # Mean over R rollouts: [B, out_dim]
+        behavior_embedding = final_hidden.mean(dim=1)
+        
+        return behavior_embedding
+
+
+
+
+class StateBehaviorEncoder(NNBase):
+    def __init__(
+        self,
+        recurrent,
+        num_actions,
+        hidden_size=64,
+        rnn_type='GRU',
+        dropout=0.0,
+        use_linear=False,
+        unit_size=256,
+        **kwargs
+    ):
+        """
+        Encodes a rollout of actions (only) into a single latent vector per rollout.
+
+        :param num_actions: how many possible actions exist (for embedding).
+        :param hidden_size: final output dimension (matching ProgramEncoder).
+        :param rnn_type: 'GRU' or 'LSTM'.
+        :param dropout: dropout on the RNN.
+        :param use_linear: if True, project from `unit_size` down to `hidden_size`.
+        :param unit_size: internal dimension for the RNN and/or embedding.
+        """
+        # We set recurrent=True so NNBase will handle RNN init for us
+        super(StateBehaviorEncoder, self).__init__(
+            recurrent=True,
+            recurrent_input_size=unit_size,   # dimension fed into the RNN
+            hidden_size=unit_size,  # RNN’s hidden dimension
+            dropout=dropout,
+            rnn_type=rnn_type
+        )
+
+        # Same style init as ConditionPolicy, etc.
+        init_ = lambda m: init(
+            m,
+            nn.init.orthogonal_,
+            lambda x: nn.init.constant_(x, 0),
+            nn.init.calculate_gain('relu')
+        )
+
+        self.num_actions = num_actions
+        self.hidden_size = hidden_size
+        self.rnn_type = rnn_type
+        self._use_linear = use_linear
+        self.unit_size = unit_size
+        self.state_shape = (kwargs['input_channel'], kwargs['input_height'], kwargs['input_width'])
+        # 1) Action embedding: each action ID → (unit_size)
+        self.action_encoder = nn.Embedding(num_actions, unit_size)
+
+        # 2) Optional projection from `unit_size` → `hidden_size`
+        if use_linear:
+            self.proj = nn.Linear(unit_size, hidden_size)
+
+        # 3) State Embedding
+        self.state_encoder = nn.Sequential(
+            init_(nn.Conv2d(self.state_shape[0], 32, 3, stride=1)), nn.ReLU(),
+            init_(nn.Conv2d(32, 32, 3, stride=1)), nn.ReLU(), Flatten(),
+            init_(nn.Linear(32 * 4 * 4, hidden_size)), nn.ReLU())
+        
+        self.state_projector = nn.Linear(hidden_size, unit_size)
+
+    def forward(self, s_h, a_h, s_h_len, a_h_len):
+        """
+        Encode a sequence of states using an RNN.
+        
+        :param s_h: shape (B, R, T, C, H, W) — B = programs, R = rollouts, T = time
+        :param a_h: not used, just pass for compatibility
+        :return: shape (B, out_dim), aggregated behavior embedding
+        """
+        B, R, T, C, H, W = s_h.shape
+        BR = B * R
+
+        # Flatten to [BR*T, C, H, W] to pass through ConvNet
+        s_h = s_h.view(BR * T, C, H, W)  # [BR*T, C, H, W]
+        state_embeddings = self.state_encoder(s_h)  # [BR*T, hidden_size]
+
+        # Project to RNN input dim: [BR*T, unit_size]
+        projected_state = self.state_projector(state_embeddings)
+
+        # Reshape to sequence form: [BR, T, unit_size]
+        projected_state_seq = projected_state.view(BR, T, self.unit_size)
+        s_h_len_flat = s_h_len.view(BR)
+
+        # Transpose for RNN: [T, BR, unit_size]
+        # embedded_s = projected_state_seq.transpose(0, 1)
+        packed_s = pack_padded_sequence(
+            projected_state_seq, 
+            lengths=s_h_len_flat.cpu(), 
+            batch_first=True, 
+            enforce_sorted=False
+        )
+
+        # Run RNN
+        if self.rnn_type.upper() == 'GRU':
+            packed_outputs, rnn_hxs = self.gru(packed_s)  # rnn_hxs: [num_layers, BR, unit_size]
+        else:
+            packed_outputs, (h_n, c_n) = self.lstm(packed_s)
+            rnn_hxs = h_n
+
+        # Get last hidden state from top layer: [BR, unit_size]
+        final_hidden = rnn_hxs[-1]
+
+        # Optional projection: [BR, hidden_size]
+        if self._use_linear:
+            final_hidden = self.proj(final_hidden)
+            out_dim = self.hidden_size
+        else:
+            out_dim = self.unit_size
+
+        # Reshape back to [B, R, out_dim]
+        final_hidden = final_hidden.view(B, R, out_dim)
+
+        # Mean over R rollouts: [B, out_dim]
+        behavior_embedding = final_hidden.mean(dim=1)
+        return behavior_embedding
+
+
+
+class ProgramEncoder(NNBase):
     def __init__(self, num_inputs, num_outputs, recurrent=True, hidden_size=64, rnn_type='GRU', two_head=False, dropout=0.0, use_linear=False, unit_size=256):
-        super(Encoder, self).__init__(recurrent, num_inputs, unit_size, dropout, rnn_type)
+        super(ProgramEncoder, self).__init__(recurrent, num_inputs, unit_size, dropout, rnn_type)
 
         self._rnn_type = rnn_type
         self._two_head = two_head
@@ -427,7 +985,507 @@ class Decoder(NNBase):
 
         return value_all, pred_programs_all, pred_programs_len, pred_programs_log_probs_all, raw_output_logits_all,\
                eop_pred_programs_all, raw_eop_output_logits_all, output_mask_all, dist_entropy_all
+               
+               
+class DecoderTransformer(NNBase):
+    def __init__(self, num_inputs, num_outputs, recurrent=False, hidden_size=64, rnn_type='GRU', two_head=False, dropout=0.0, unit_size=256, **kwargs):
+        # Use False for recurrent since we're using a transformer
+        super(DecoderTransformer, self).__init__(False, num_inputs+unit_size, unit_size, dropout, rnn_type)
 
+        self._rnn_type = rnn_type
+        self._two_head = two_head
+        self.num_inputs = num_inputs
+        self.use_simplified_dsl = kwargs['dsl']['use_simplified_dsl']
+        self.max_program_len = kwargs['dsl']['max_program_len']
+        self.grammar = kwargs['grammar']
+        self.num_program_tokens = kwargs['num_program_tokens']
+        self.setup = kwargs['algorithm']
+        self.setup = 'CEM' if self.setup == 'CEM_transfer' else self.setup
+        self.rl_algorithm = kwargs['rl']['algo']['name']
+        self.value_method = kwargs['rl']['value_method']
+        self.value_embedding = 'eop_rnn'
+
+        print("DecoderTransformer max_program_len: ", self.max_program_len)
+        print("DecoderTransformer dropout: ", dropout)
+        print("DecoderTransformer use_simplified_dsl: ", self.use_simplified_dsl)
+        print("DecoderTransformer num_outputs (token space): ", num_outputs)
+        print("DecoderTransformer num_program_tokens: ", self.num_program_tokens)
+    
+        init_ = lambda m: init(m, nn.init.orthogonal_, lambda x: nn.init.constant_(x, 0), np.sqrt(2))
+
+        # Token embedding layer
+        self.token_encoder = nn.Embedding(num_inputs, unit_size)
+        
+        # Positional embedding
+        self.pos_encoder = nn.Parameter(torch.zeros(1, self.max_program_len, unit_size))
+        nn.init.normal_(self.pos_encoder, std=0.02)
+        
+        # Transformer layers configuration
+        self.num_layers = kwargs.get('net', {}).get('transformer_decoder_layers', 6)
+        self.num_heads = kwargs.get('net', {}).get('transformer_decoder_heads', 8)
+        
+        # Create TransformerDecoder layer
+        decoder_layer = nn.TransformerDecoderLayer(
+            d_model=unit_size,
+            nhead=self.num_heads,
+            dim_feedforward=unit_size*4,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True  # Pre-norm architecture for better stability
+        )
+        
+        # TransformerDecoder (processes tokens sequentially with attention)
+        self.transformer_decoder = nn.TransformerDecoder(
+            decoder_layer, 
+            num_layers=self.num_layers
+        )
+        
+        # Output projection layer (from unit_size to vocabulary size)
+        self.token_output_layer = nn.Linear(unit_size, num_outputs)
+        
+        # Layer norms
+        self.pre_decoder_ln = nn.LayerNorm(unit_size)
+        self.final_ln = nn.LayerNorm(unit_size)
+
+        # For critic network in RL setup
+        if (self.setup =='RL' or self.setup =='supervisedRL') and kwargs['rl']['algo']['name'] != 'reinforce':
+            self.critic = nn.Sequential(
+                init_(nn.Linear(unit_size, unit_size)), nn.Tanh(),
+                init_(nn.Linear(unit_size, unit_size)), nn.Tanh())
+
+            self.critic_linear = init_(nn.Linear(unit_size, 1))
+
+        # For two-head policy (separate end-of-program prediction)
+        if self._two_head:
+            self.eop_output_layer = nn.Sequential(
+                init_(nn.Linear(unit_size, unit_size)), nn.Tanh(),
+                init_(nn.Linear(unit_size, 2)))
+
+        # Initialize syntax checker for grammar-based decoding
+        self._init_syntax_checker(kwargs)
+
+        self.softmax = nn.LogSoftmax(dim=-1)
+
+        # Add Linear Layer to uncompress latent
+        self._use_linear = kwargs['net']['use_linear']
+        if self._use_linear:
+            self.fc = nn.Linear(hidden_size, unit_size)
+
+        self.train()
+
+    def _init_syntax_checker(self, config):
+        # use syntax checker to check grammar of output program prefix
+        if self.use_simplified_dsl:
+            self.prl_tokens = config['prl_tokens']
+            self.dsl_tokens = config['dsl_tokens']
+            self.prl2dsl_mapping = config['prl2dsl_mapping']
+            syntax_checker_tokens = copy.copy(config['prl_tokens'])
+        else:
+            syntax_checker_tokens = copy.copy(config['dsl_tokens'])
+        
+        T2I = {token: i for i, token in enumerate(syntax_checker_tokens)}
+        T2I['<pad>'] = len(syntax_checker_tokens)
+        self.T2I = T2I
+        syntax_checker_tokens.append('<pad>')
+        
+        print("DecoderTransformer _init_syntax_checker len: ", len(syntax_checker_tokens))
+        
+        if self.grammar == 'handwritten':
+            self.syntax_checker = PySyntaxChecker(T2I, use_cuda='cuda' in config['device'],
+                                                 use_simplified_dsl=self.use_simplified_dsl,
+                                                 new_tokens=syntax_checker_tokens)
+
+    def generate_square_subsequent_mask(self, sz, device):
+        """
+        Generate a square mask for the sequence to prevent attending to future positions.
+        The masked positions are filled with float('-inf').
+        Unmasked positions are filled with float(0.0).
+        """
+        mask = (torch.triu(torch.ones(sz, sz, device=device)) == 1).transpose(0, 1)
+        mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
+        return mask
+
+    def _forward_one_pass(self, current_tokens, context, transformer_outputs, step_idx, causal_mask):
+        """
+        Process a single decoding step using the transformer decoder
+        
+        Args:
+            current_tokens: Current token IDs for the batch
+            context: The latent embedding vectors
+            transformer_outputs: Previous transformer outputs to use as memory
+            step_idx: Current decoding step index
+            causal_mask: Causal mask for self-attention
+            
+        Returns:
+            value: Value prediction (for RL)
+            output_logits: Token logits
+            transformer_outputs: Updated transformer memory
+            eop_output_logits: End-of-program logits (if two_head=True)
+        """
+        batch_size = current_tokens.shape[0]
+        device = current_tokens.device
+        
+        # Embed current tokens and add positional encoding
+        token_embedding = self.token_encoder(current_tokens)  # [batch_size, unit_size]
+        
+        # Create target sequence for the decoder (with positional info)
+        if transformer_outputs is None:
+            # First step: just use the current token embedding
+            decoder_input = token_embedding.unsqueeze(1)  # [batch_size, 1, unit_size]
+            pos_embeddings = self.pos_encoder[:, 0:1, :]  # [1, 1, unit_size]
+            decoder_input = decoder_input + pos_embeddings
+        else:
+            # For later steps, use all previous outputs plus new token
+            decoder_input = torch.cat([transformer_outputs, token_embedding.unsqueeze(1)], dim=1)
+            pos_embeddings = self.pos_encoder[:, :decoder_input.size(1), :]
+            decoder_input = decoder_input + pos_embeddings
+            
+        # Apply layer norm before decoder
+        decoder_input = self.pre_decoder_ln(decoder_input)
+        
+        # Create attention mask that prevents attending to subsequent positions
+        if causal_mask is None and decoder_input.size(1) > 1:
+            causal_mask = self.generate_square_subsequent_mask(decoder_input.size(1), device)
+            
+        # Memory is the context (latent representation) expanded to match sequence length
+        memory = context.unsqueeze(1)  # [batch_size, 1, unit_size]
+        
+        # Run transformer decoder
+        # For first step, there's no self-attention mask
+        # transformer_out = self.transformer_decoder(
+        #     tgt=decoder_input,  # Target sequence (tokens so far)
+        #     memory=memory,      # Memory from encoder (latent embedding)
+        #     tgt_mask=causal_mask  # Causal mask for self-attention
+        # )
+        transformer_out = checkpoint(
+            self.transformer_decoder,
+            decoder_input,  # Target sequence (tokens so far)
+            memory,         # Memory from encoder (latent embedding)
+            causal_mask     # Causal mask for self-attention
+        )
+        
+        # Apply final layer norm
+        transformer_out = self.final_ln(transformer_out)
+        
+        # Get last token's output for prediction
+        last_token_output = transformer_out[:, -1]  # [batch_size, unit_size]
+        
+        # Generate logits for next token prediction
+        output_logits = self.token_output_layer(last_token_output)
+        
+        # For RL, calculate value prediction
+        value = None
+        if (self.setup =='RL' or self.setup =='supervisedRL') and self.rl_algorithm != 'reinforce':
+            hidden_critic = self.critic(last_token_output)
+            value = self.critic_linear(hidden_critic)
+            
+        # For two-head policy, predict end-of-program token separately
+        eop_output_logits = None
+        if self._two_head:
+            eop_output_logits = self.eop_output_layer(last_token_output)
+            
+        return value, output_logits, transformer_out, eop_output_logits
+
+    def _temp_init(self, batch_size, device):
+        # create input with token as DEF
+        inputs = torch.ones((batch_size)).to(torch.long).to(device)
+        inputs = (0 * inputs)  # Start with DEF token (ID 0)
+
+        # Create mask (all ones since we're starting)
+        gru_mask = torch.ones(batch_size, dtype=torch.bool, device=device)
+        return inputs, gru_mask
+
+    def _get_syntax_mask(self, batch_size, current_tokens, mask_size, grammar_state):
+        out_of_syntax_list = []
+        device = current_tokens.device
+        # Create output tensor with correct shape [batch_size, 1, mask_size]
+        out_of_syntax_mask = torch.zeros((batch_size, 1, mask_size),
+                                         dtype=torch.bool, device=device)
+
+        for program_idx, inp_token in enumerate(current_tokens):
+            inp_dsl_token = inp_token.detach().cpu().numpy().item()
+            out_of_syntax_list.append(self.syntax_checker.get_sequence_mask(grammar_state[program_idx],[inp_dsl_token]).to(device))
+
+        torch.cat(out_of_syntax_list, 0, out=out_of_syntax_mask)
+        out_of_syntax_mask = out_of_syntax_mask.squeeze()
+        syntax_mask = torch.where(out_of_syntax_mask,
+                                  -torch.finfo(torch.float32).max * torch.ones_like(out_of_syntax_mask).float(),
+                                  torch.zeros_like(out_of_syntax_mask).float())
+
+        # If m) is not part of next valid tokens in syntax_mask then only eop action can be eop=0 otherwise not
+        # use absence of m) to mask out eop = 1, use presence of m) and eop=1 to mask out all tokens except m)
+        eop_syntax_mask = None
+        if self._two_head:
+            # use absence of m) to mask out eop = 1
+            gather_m_closed = torch.tensor(batch_size * [self.T2I['m)']], dtype=torch.long, device=device).view(-1, 1)
+            eop_in_valid_set = torch.gather(syntax_mask, 1, gather_m_closed)
+            eop_syntax_mask = torch.zeros((batch_size, 2), device=device)
+            # if m) is absent we can't predict eop=1
+            eop_syntax_mask[:, 1] = eop_in_valid_set.flatten()
+
+        return syntax_mask, eop_syntax_mask, grammar_state
+
+    def _get_eop_preds(self, eop_output_logits, eop_syntax_mask, syntax_mask, output_mask, deterministic=False):
+        batch_size = eop_output_logits.shape[0]
+        device = eop_output_logits.device
+
+        # eop_action
+        if eop_syntax_mask is not None:
+            assert eop_output_logits.shape == eop_syntax_mask.shape
+            eop_output_logits += eop_syntax_mask
+        if self.setup == 'supervised':
+            eop_preds = self.softmax(eop_output_logits).argmax(dim=-1).to(torch.bool)
+        elif self.setup == 'RL':
+            # define distribution over current logits
+            eop_dist = FixedCategorical(logits=eop_output_logits)
+            # sample actions
+            eop_preds = eop_dist.mode() if deterministic else eop_dist.sample()
+        else:
+            raise NotImplementedError()
+
+        #  use presence of m) and eop=1 to mask out all tokens except m)
+        if self.grammar != 'None':
+            new_output_mask = (~(eop_preds.to(torch.bool))) * output_mask
+            assert output_mask.dtype == torch.bool
+            output_mask_change = (new_output_mask != output_mask).view(-1, 1)
+            output_mask_change_repeat = output_mask_change.repeat(1, syntax_mask.shape[1])
+            new_syntax_mask = -torch.finfo(torch.float32).max * torch.ones_like(syntax_mask).float()
+            new_syntax_mask[:, self.T2I['m)']] = 0
+            syntax_mask = torch.where(output_mask_change_repeat, new_syntax_mask, syntax_mask)
+
+        return eop_preds, eop_output_logits, syntax_mask
+
+    def forward(self, gt_programs, embeddings, teacher_enforcing=True, action=None, output_mask_all=None,
+                eop_action=None, deterministic=False, evaluate=False, max_program_len=float('inf')):
+        if self.setup == 'supervised':
+            assert deterministic == True
+        batch_size, device = embeddings.shape[0], embeddings.device
+        
+        # NOTE: for pythorch >=1.2.0, ~ only works correctly on torch.bool
+        if evaluate:
+            output_mask = output_mask_all[:, 0]
+        else:
+            output_mask = torch.ones(batch_size).to(torch.bool).to(device)
+
+        current_tokens, gru_mask = self._temp_init(batch_size, device)
+
+        # Add Linear Layer to uncompress latent if needed
+        if self._use_linear:
+            embeddings = self.fc(embeddings)
+
+        # Encode programs
+        max_program_len = min(max_program_len, self.max_program_len)
+        value_all = []
+        pred_programs = []
+        pred_programs_log_probs_all = []
+        dist_entropy_all = []
+        eop_dist_entropy_all = []
+        output_logits_all = []
+        eop_output_logits_all = []
+        eop_pred_programs = []
+        
+        if not evaluate:
+            output_mask_all = torch.ones(batch_size, self.max_program_len).to(torch.bool).to(device)
+        first_end_token_idx = self.max_program_len * torch.ones(batch_size).to(device)
+
+        # using get_initial_checker_state2 because we skip prediction for 'DEF', 'run' tokens
+        if self.grammar == 'handwritten':
+            if self.use_simplified_dsl:
+                grammar_state = [self.syntax_checker.get_initial_checker_state2()
+                                for _ in range(batch_size)]
+            else:
+                grammar_state = [self.syntax_checker.get_initial_checker_state()
+                                for _ in range(batch_size)]
+
+        # Initialize transformer outputs to None
+        transformer_outputs = None
+        causal_mask = None
+
+        for i in range(max_program_len):
+            # Run one step of the transformer decoder
+            value, output_logits, transformer_outputs, eop_output_logits = self._forward_one_pass(
+                current_tokens, embeddings, transformer_outputs, i, causal_mask
+            )
+
+            # limit possible actions using syntax checker if available
+            syntax_mask = None
+            eop_syntax_mask = None
+            if self.grammar != 'None':
+                mask_size = output_logits.shape[1]
+                syntax_mask, eop_syntax_mask, grammar_state = self._get_syntax_mask(batch_size, current_tokens,
+                                                                                  mask_size, grammar_state)
+
+            # get eop action and new syntax mask if using syntax checker
+            if self._two_head:
+                eop_preds, eop_output_logits, syntax_mask = self._get_eop_preds(eop_output_logits, eop_syntax_mask,
+                                                                              syntax_mask, output_mask_all[:, i])
+
+            # apply softmax
+            if syntax_mask is not None:
+                assert (output_logits.shape == syntax_mask.shape), '{}:{}'.format(output_logits.shape, syntax_mask.shape)
+                output_logits += syntax_mask
+                
+            if self.setup == 'supervised' or self.setup == 'CEM' or self.setup == 'PPO_option' or self.setup == 'SAC_option':
+                preds = self.softmax(output_logits).argmax(dim=-1)
+            elif self.setup == 'RL':
+                # define distribution over current logits
+                dist = FixedCategorical(logits=output_logits)
+                # sample actions
+                preds = dist.mode().squeeze() if deterministic else dist.sample().squeeze()
+                # calculate log probabilities
+                if evaluate:
+                    assert action[:,i].shape == preds.shape
+                    pred_programs_log_probs = dist.log_probs(action[:,i])
+                else:
+                    pred_programs_log_probs = dist.log_probs(preds)
+
+                if self._two_head:
+                    raise NotImplementedError()
+                # calculate entropy
+                dist_entropy = dist.entropy()
+                if self._two_head:
+                    raise NotImplementedError()
+                pred_programs_log_probs_all.append(pred_programs_log_probs)
+                dist_entropy_all.append(dist_entropy.view(-1, 1))
+            else:
+                raise NotImplementedError()
+
+            # calculate mask for current tokens
+            assert preds.shape == output_mask.shape
+            if not evaluate:
+                if self._two_head:
+                    output_mask = (~(eop_preds.to(torch.bool))) * output_mask
+                else:
+                    output_mask = (~((preds == self.num_program_tokens - 1).to(torch.bool))) * output_mask
+
+                # recalculate first occurrence of <pad> for each program
+                first_end_token_idx = torch.min(first_end_token_idx,
+                                              ((self.max_program_len * output_mask.float()) +
+                                               ((1 - output_mask.float()) * i)).flatten())
+
+            value_all.append(value)
+            output_logits_all.append(output_logits)
+            pred_programs.append(preds)
+            if self._two_head:
+                eop_output_logits_all.append(eop_output_logits)
+                eop_pred_programs.append(eop_preds)
+            if not evaluate:
+                output_mask_all[:, i] = output_mask.flatten()
+
+            if self.setup == 'supervised':
+                if teacher_enforcing:
+                    current_tokens = gt_programs[:, i+1].squeeze()
+                else:
+                    current_tokens = preds.squeeze()
+            else:
+                if evaluate:
+                    assert self.setup == 'RL'
+                    current_tokens = action[:, i]
+                else:
+                    current_tokens = preds.squeeze()
+
+        # unmask first end-token for two headed policy
+        if not evaluate:
+            output_mask_all = _unmask_idx(output_mask_all, first_end_token_idx, self.max_program_len).detach()
+
+        # combine all token parameters to get program parameters
+        raw_pred_programs_all = torch.stack(pred_programs, dim=1)
+        raw_output_logits_all = torch.stack(output_logits_all, dim=1)
+        pred_programs_len = torch.sum(output_mask_all, dim=1, keepdim=True)
+
+        if not self._two_head:
+            assert output_mask_all.dtype == torch.bool
+            pred_programs_all = torch.where(output_mask_all, raw_pred_programs_all,
+                                          int(self.num_program_tokens - 1) * torch.ones_like(raw_pred_programs_all))
+            eop_pred_programs_all = -1 * torch.ones_like(pred_programs_all)
+            raw_eop_output_logits_all = None
+        else:
+            pred_programs_all = raw_pred_programs_all
+            eop_pred_programs_all = torch.stack(eop_pred_programs, dim=1)
+            raw_eop_output_logits_all = torch.stack(eop_output_logits_all, dim=1)
+
+        # calculate log_probs, value, actions for program from token values
+        if self.setup == 'RL':
+            raw_pred_programs_log_probs_all = torch.cat(pred_programs_log_probs_all, dim=1)
+            pred_programs_log_probs_all = masked_sum(raw_pred_programs_log_probs_all, output_mask_all,
+                                                   dim=1, keepdim=True)
+
+            raw_dist_entropy_all = torch.cat(dist_entropy_all, dim=1)
+            dist_entropy_all = masked_mean(raw_dist_entropy_all, output_mask_all, dim=tuple(range(len(output_mask_all.shape))))
+
+            # calculate value for program from token values
+            if self.rl_algorithm != 'reinforce':
+                if self.value_method == 'mean':
+                    raw_value_all = torch.cat(value_all, dim=1)
+                    value_all = masked_mean(raw_value_all, output_mask_all, dim=1, keepdim=True)
+                else:
+                    # calculate value function from hidden states
+                    raw_value_all = torch.cat(value_all, dim=1)
+                    value_idx = torch.sum(output_mask_all, dim=1, keepdim=True) - 1
+                    assert len(value_idx.shape) == 2 and value_idx.shape[1] == 1
+                    value_all = torch.gather(raw_value_all, 1, value_idx)
+
+                    # This value calculation is just for sanity check
+                    with torch.no_grad():
+                        value_idx_2 = first_end_token_idx.clamp(max=self.max_program_len - 1).long().reshape(-1, 1)
+                        value_all_2 = torch.gather(raw_value_all, 1, value_idx_2)
+                        assert torch.sum(value_all != value_all_2) == 0
+                    assert value_all.shape[0] == batch_size
+            else:
+                value_all = torch.zeros_like(pred_programs_log_probs_all)
+        else:
+            dist_entropy_all = None
+            value_all = None
+
+        return value_all, pred_programs_all, pred_programs_len, pred_programs_log_probs_all, raw_output_logits_all,\
+               eop_pred_programs_all, raw_eop_output_logits_all, output_mask_all, dist_entropy_all
+
+
+class Scalar(nn.Module):
+    """
+    MLP that produces a scalar multiplier for behavior embeddings.
+    
+    Takes a behavior embedding b_z with shape (batch_size, latent_dim)
+    and outputs a scalar multiplier with shape (batch_size, 1).
+    """
+    def __init__(self, latent_dim=64, hidden_dim=128):
+        super(Scalar, self).__init__()
+        
+        # Initialize with standard weight initialization
+        init_ = lambda m: init(
+            m,
+            nn.init.orthogonal_,
+            lambda x: nn.init.constant_(x, 0),
+            nn.init.calculate_gain('relu')
+        )
+        
+        # Create a simple MLP: latent_dim → hidden_dim → hidden_dim → 1
+        self.mlp = nn.Sequential(
+            init_(nn.Linear(latent_dim, hidden_dim)),
+            nn.ReLU(),
+            init_(nn.Linear(hidden_dim, hidden_dim)),
+            nn.ReLU(),
+            init_(nn.Linear(hidden_dim, 1)),
+            # Sigmoid to output values between 0 and 1
+            nn.Sigmoid()
+        )
+        
+        # Optional scaling factor to control the range
+        self.scale_factor = nn.Parameter(torch.ones(1))
+        
+    def forward(self, x):
+        """
+        Args:
+            x: Behavior embedding tensor of shape (batch_size, latent_dim)
+            
+        Returns:
+            Scalar multiplier of shape (batch_size, 1)
+        """
+        # Compute scalar multiplier between 0 and scale_factor
+        scalar = self.mlp(x) * self.scale_factor
+        
+        return scalar
 
 class VAE(torch.nn.Module):
 
@@ -439,11 +1497,22 @@ class VAE(torch.nn.Module):
         self._tanh_after_sample   = kwargs['net']['tanh_after_sample']
         self._latent_std_mu       = kwargs['net']['latent_std_mu']
         self._latent_std_sigma    = kwargs['net']['latent_std_sigma']
+        self._bz_latent_std_mu = kwargs['net']['bz_latent_std_mu']
+        self._bz_latent_std_sigma = kwargs['net']['bz_latent_std_sigma']
         self._latent_mean_pooling = kwargs['net']['latent_mean_pooling']
         self._use_latent_dist     = not kwargs['net']['controller']['use_decoder_dist']
         self._rnn_type            = kwargs['net']['rnn_type']
         self._use_transformer_encoder = kwargs['net']['use_transformer_encoder']
         self._use_transformer_decoder = kwargs['net']['use_transformer_decoder']
+
+        self._use_transformer_encoder_behavior = kwargs['net']['use_transformer_encoder_behavior']
+        self._use_transformer_decoder_behavior = kwargs['net']['use_transformer_decoder_behavior']
+        
+        # For scaling b_z
+        self._use_bz_scalar = kwargs['use_bz_scalar']
+        if self._use_bz_scalar:
+            self.scalar = Scalar()
+        
         print("tanh after sample: ", self._tanh_after_sample)
         print("Option VAE latent STD mu:", self._latent_std_mu)
         print("Option VAE latent STD sigma:", self._latent_std_sigma)
@@ -451,20 +1520,54 @@ class VAE(torch.nn.Module):
 
         num_outputs = num_inputs
 
-
+        if kwargs['behavior_representation'] == 'state_sequence':
+            self.behavior_encoder = StateBehaviorEncoder(recurrent=kwargs['recurrent_policy'],
+                                num_actions=kwargs['dsl']['num_agent_actions'],
+                                hidden_size=kwargs['num_lstm_cell_units'], rnn_type=kwargs['net']['rnn_type'],
+                                dropout=kwargs['net']['dropout'], use_linear=kwargs['net']['use_linear'],
+                                unit_size=kwargs['net']['num_rnn_encoder_units'],
+                                **kwargs)
+        elif kwargs['behavior_representation'] == 'action_sequence':
+            if self._use_transformer_encoder_behavior:
+                self.behavior_encoder = ActionBehaviorEncoderTransformer(
+                                recurrent=kwargs['recurrent_policy'],
+                                num_actions=kwargs['dsl']['num_agent_actions'],
+                                hidden_size=kwargs['num_lstm_cell_units'], 
+                                rnn_type=kwargs['net']['rnn_type'],
+                                dropout=kwargs['net']['dropout'], 
+                                use_linear=kwargs['net']['use_linear'],
+                                unit_size=kwargs['net']['num_rnn_encoder_units'],
+                                transformer_layers=kwargs['net']['transformer_layers'],
+                                transformer_heads=kwargs['net']['transformer_heads'],
+                                **kwargs)
+            else:
+                self.behavior_encoder = ActionBehaviorEncoder(recurrent=kwargs['recurrent_policy'],
+                                    num_actions=kwargs['dsl']['num_agent_actions'],
+                                    hidden_size=kwargs['num_lstm_cell_units'], rnn_type=kwargs['net']['rnn_type'],
+                                    dropout=kwargs['net']['dropout'], use_linear=kwargs['net']['use_linear'],
+                                    unit_size=kwargs['net']['num_rnn_encoder_units'],
+                                    **kwargs)
         if True:
-            self.encoder = Encoder(num_inputs, num_outputs, recurrent=kwargs['recurrent_policy'],
+            self.program_encoder = ProgramEncoder(num_inputs, num_outputs, recurrent=kwargs['recurrent_policy'],
                                 hidden_size=kwargs['num_lstm_cell_units'], rnn_type=kwargs['net']['rnn_type'],
                                 two_head=kwargs['two_head'], dropout=kwargs['net']['dropout'], 
                                 use_linear=kwargs['net']['use_linear'], unit_size=kwargs['net']['num_rnn_encoder_units'])
 
         if True:
-            self.decoder = Decoder(num_inputs, num_outputs, recurrent=kwargs['recurrent_policy'],
-                                hidden_size=kwargs['num_lstm_cell_units'], rnn_type=kwargs['net']['rnn_type'],
-                                num_program_tokens=num_program_tokens, dropout=kwargs['net']['dropout'], 
-                                unit_size=kwargs['net']['num_rnn_decoder_units'], **kwargs)
+            if self._use_transformer_decoder_behavior:
+                self.decoder = DecoderTransformer(num_inputs, num_outputs, recurrent=kwargs['recurrent_policy'],
+                                    hidden_size=kwargs['num_lstm_cell_units'], rnn_type=kwargs['net']['rnn_type'],
+                                    num_program_tokens=num_program_tokens, dropout=kwargs['net']['dropout'], 
+                                    unit_size=kwargs['net']['num_rnn_decoder_units'], **kwargs)
+            else:
+                self.decoder = Decoder(num_inputs, num_outputs, recurrent=kwargs['recurrent_policy'],
+                                    hidden_size=kwargs['num_lstm_cell_units'], rnn_type=kwargs['net']['rnn_type'],
+                                    num_program_tokens=num_program_tokens, dropout=kwargs['net']['dropout'], 
+                                    unit_size=kwargs['net']['num_rnn_decoder_units'], **kwargs)
         self._enc_mu = torch.nn.Linear(kwargs['num_lstm_cell_units'], kwargs['num_lstm_cell_units'])
         self._enc_log_sigma = torch.nn.Linear(kwargs['num_lstm_cell_units'], kwargs['num_lstm_cell_units'])
+        self._bz_enc_mu = torch.nn.Linear(kwargs['num_lstm_cell_units'], kwargs['num_lstm_cell_units'])
+        self._bz_enc_log_sigma = torch.nn.Linear(kwargs['num_lstm_cell_units'], kwargs['num_lstm_cell_units'])
         self.tanh = torch.nn.Tanh()
 
     @property
@@ -487,23 +1590,72 @@ class VAE(torch.nn.Module):
         self.z_mean = mu
         self.z_sigma = sigma
 
-        return mu + sigma * Variable(std_z, requires_grad=False)  # Reparameterization trick
+        return mu, mu + sigma * Variable(std_z, requires_grad=False)  # Reparameterization trick
+
+    def _sample_latent_bz(self, h_enc):
+        """
+        Return the latent normal sample b_z ~ N(mu, sigma^2)
+        """
+        mu = self._bz_enc_mu(h_enc)
+        log_sigma = self._bz_enc_log_sigma(h_enc)
+        sigma = torch.exp(log_sigma)
+        std_bz = torch.from_numpy(np.random.normal(self._bz_latent_std_mu, self._bz_latent_std_sigma, size=sigma.size())).to(torch.float).to(h_enc.device)
+        if self._tanh_after_mu_sigma: #False by default
+            mu = self.tanh(mu)
+            sigma = self.tanh(sigma)
+        self.b_z_mean = mu
+        self.b_z_sigma = sigma
+        return mu, mu + sigma * Variable(std_bz, requires_grad=False)  # Reparameterization trick
+
 
     @staticmethod
     def latent_loss(z_mean, z_stddev):
         mean_sq = z_mean * z_mean
         stddev_sq = z_stddev * z_stddev
         return 0.5 * torch.mean(mean_sq + stddev_sq - torch.log(stddev_sq) - 1)
+        
+    @staticmethod
+    def combined_latent_loss(z, b_z):
+        """
+        Combined latent loss that pools the actual z and b_z vectors,
+        then calculates KL divergence from the pooled vectors
+        """
+        # Check that dimensions match
+        assert z is not None and b_z is not None, "Actual latent vectors (z and b_z) must be provided"
+        assert z.shape == b_z.shape, "Program and behavior vectors must have the same shape"
 
-    def forward(self, programs, program_masks, teacher_enforcing, deterministic=True):
+        # Pool the vectors (concatenate along batch dimension)
+        pooled_vectors = torch.cat([z, b_z], dim=0)
+
+        # Calculate combined mean and variance from pooled vectors
+        combined_mean = torch.mean(pooled_vectors, dim=0, keepdim=True)
+        combined_var = torch.var(pooled_vectors, dim=0, keepdim=True)
+        combined_stddev = torch.sqrt(combined_var)
+
+        # Expand to match batch size for calculating KL divergence
+        batch_size = z.shape[0]
+        combined_mean = combined_mean.repeat(batch_size, 1)
+        combined_stddev = combined_stddev.repeat(batch_size, 1)
+
+        # Now compute KL divergence between combined distribution N(combined_mean, combined_stddev²) and N(0,1)
+        combined_mean_sq = combined_mean.pow(2)
+        combined_stddev_sq = combined_stddev.pow(2)
+
+        # KL(N(μ,σ²) || N
+        # (0,1)) = 0.5 * (μ² + σ² - log(σ²) - 1)
+        kl_div = 0.5 * torch.mean(combined_mean_sq + combined_stddev_sq - torch.log(combined_stddev_sq) - 1)
+
+        return kl_div
+
+    def forward(self, programs, program_masks, teacher_enforcing, a_h, s_h, a_h_len, s_h_len, deterministic=True):
         program_lens = program_masks.squeeze().sum(dim=-1)
 
         t = time.time()
         if self._use_transformer_encoder:
             program_masks = program_masks.squeeze().unsqueeze(-2)
-            _, h_enc = self.encoder(programs, program_masks)
+            _, h_enc = self.program_encoder(programs, program_masks)
         else:
-            _, h_enc = self.encoder(programs, program_lens)
+            _, h_enc = self.program_encoder(programs, program_lens)
         encoder_time = time.time() - t
 
         if self._latent_mean_pooling:
@@ -513,21 +1665,46 @@ class VAE(torch.nn.Module):
             h_enc = output_enc_mean
 
         if self._rnn_type == 'GRU':
-            z = h_enc.squeeze() if self._vanilla_ae else self._sample_latent(h_enc.squeeze())
+            if self._vanilla_ae:
+                z = h_enc.squeezee()
+            else:
+                z_mu, z = self._sample_latent(h_enc.squeeze())
         elif self._rnn_type == 'LSTM':
-            z = h_enc[0].squeeze() if self._vanilla_ae else self._sample_latent(h_enc[0].squeeze())
+            if self._vanilla_ae:
+                z = h_enc[0].squeeze()
+            else:
+                z_mu, z = self._sample_latent(h_enc[0].squeeze())
         else:
             raise NotImplementedError()
         
         pre_tanh_z = z
+        b_z_mu, b_z = self._sample_latent_bz(self.behavior_encoder(s_h, a_h, s_h_len, a_h_len)) #pretanh behavior embedding
+        pre_tanh_b_z = b_z
+
         if self._tanh_after_sample:
+            z_mu = self.tanh(z_mu)
             z = self.tanh(z)
+            b_z_mu = self.tanh(b_z_mu)
+            b_z = self.tanh(b_z)
+        # print(f"z.shape: {z.shape}, b_z.shape: {b_z.shape}")
+        
         
         t = time.time()
-        outputs = self.decoder(programs, z, teacher_enforcing=teacher_enforcing, deterministic=deterministic)
+        
+        # programs here is the ground truth
+        z_outputs = self.decoder(programs, z, teacher_enforcing=teacher_enforcing, deterministic=deterministic)
+        if self._use_bz_scalar:
+            # Use the scalar to scale the behavior embedding
+            b_z_scalar = self.scalar(b_z)
+            b_z = b_z * b_z_scalar
+        b_z_outputs = self.decoder(programs, b_z, teacher_enforcing=teacher_enforcing, deterministic=deterministic)
+         
+        # b_z_outputs = self.decoder(programs, b_z, teacher_enforcing=teacher_enforcing, deterministic=deterministic)
+
         decoder_time = time.time() - t
 
-        return outputs, z, pre_tanh_z, encoder_time, decoder_time
+        return z_outputs, b_z_outputs, z, pre_tanh_z, encoder_time, decoder_time, b_z, pre_tanh_b_z, z_mu, b_z_mu
+
 
 
 class ConditionPolicy(NNBase):
@@ -631,7 +1808,9 @@ class ConditionPolicy(NNBase):
         old_states = s_h.squeeze().view(new_batch_size, C, H, W)
 
         """ get state_embedding of one image per demonstration"""
-        state_embeddings = self.state_encoder(s_h[:, :, 0, :, :, :].view(new_batch_size, C, H, W))
+        new_s_h = s_h[:, :, 0, :, :, :].view(new_batch_size, C, H, W)
+        #print(f"condition new_s_h shape: {new_s_h.shape}")
+        state_embeddings = self.state_encoder(new_s_h)
         state_embeddings = state_embeddings.view(batch_size, num_demos_per_program, self._hidden_size)
         assert state_embeddings.shape[0] == batch_size and state_embeddings.shape[1] == num_demos_per_program
         state_embeddings = state_embeddings.squeeze()
@@ -793,6 +1972,7 @@ class ProgramVAE(nn.Module):
         self.teacher_enforcing = kwargs['net']['decoder']['use_teacher_enforcing']
         self.vae = VAE(num_outputs, num_program_tokens, **kwargs)
         self.condition_policy = ConditionPolicy(envs, **kwargs)
+        self.POMDP = kwargs['POMDP']
 
     @property
     def recurrent_hidden_state_size(self):
@@ -801,18 +1981,57 @@ class ProgramVAE(nn.Module):
 
     @property
     def is_recurrent(self):
-        return self.vae.encoder.is_recurrent
+        return self.vae.program_encoder.is_recurrent
 
-    def forward(self, programs, program_masks, init_states, a_h, rnn_hxs=None, masks=None, action=None, output_mask_all=None, eop_action=None,
+    def forward(self, programs, program_masks, s_h_list, a_h, s_h_len, a_h_len, rnn_hxs=None, masks=None, action=None, output_mask_all=None, eop_action=None,
                 agent_actions=None, agent_action_masks=None, deterministic=False, evaluate=False):
-
+        #print(f"a_h.shape: {a_h.shape}")
+        #print(f"s_h.shape: {init_states.shape}")
+        s_h = s_h_list[0]
+        s_h_partial = s_h_list[1]
+        if self.POMDP:
+            encode_sh = s_h_partial
+        else:
+            encode_sh = s_h
+        init_states = s_h[:, :, 0, :, :, :].unsqueeze(2)
+        # print(f"init_states.shape: {init_states.shape}")
         if self.vae.decoder.setup == 'supervised':
-            output, z, pre_tanh_z, encoder_time, decoder_time = self.vae(programs, program_masks, self.teacher_enforcing, deterministic=deterministic)
-            _, pred_programs, pred_programs_len, _, output_logits, eop_pred_programs, eop_output_logits, pred_program_masks, _ = output
-            _, _, _, action_logits, action_masks, _ = self.condition_policy(init_states, a_h, z, self.teacher_enforcing,
+            z_output, b_z_output, z, pre_tanh_z, encoder_time, decoder_time, b_z, pre_tanh_b_z, z_mu, b_z_mu = self.vae(programs, program_masks, self.teacher_enforcing, deterministic=deterministic, a_h = a_h, s_h = encode_sh, a_h_len = a_h_len, s_h_len = s_h_len)
+            _, z_pred_programs, z_pred_programs_len, _, z_output_logits, z_eop_pred_programs, z_eop_output_logits, z_pred_program_masks, _ = z_output
+            _, b_z_pred_programs, b_z_pred_programs_len, _, b_z_output_logits, b_z_eop_pred_programs, b_z_eop_output_logits, b_z_pred_program_masks, _ = b_z_output
+            _, _, _, z_action_logits, z_action_masks, _ = self.condition_policy(init_states, a_h, z, self.teacher_enforcing,
                                                                          deterministic=deterministic)
-            return pred_programs, pred_programs_len, output_logits, eop_pred_programs, eop_output_logits, \
-                   pred_program_masks, action_logits, action_masks, z, pre_tanh_z, encoder_time, decoder_time
+            _, _, _, b_z_action_logits, b_z_action_masks, _ = self.condition_policy(init_states, a_h, b_z, self.teacher_enforcing,
+                                                                         deterministic=deterministic)
+            z_output = {
+                'pred_programs': z_pred_programs,
+                'pred_programs_len': z_pred_programs_len,
+                'output_logits': z_output_logits,
+                'eop_pred_programs': z_eop_pred_programs,
+                'eop_output_logits': z_eop_output_logits,
+                'pred_program_masks': z_pred_program_masks,
+                'action_logits': z_action_logits,
+                'action_masks': z_action_masks,
+                'pre_tanh': pre_tanh_z,
+                'z': z,
+                'z_mu': z_mu,
+            }
+
+            b_z_output = {
+                'pred_programs': b_z_pred_programs,
+                'pred_programs_len': b_z_pred_programs_len,
+                'output_logits': b_z_output_logits,
+                'eop_pred_programs': b_z_eop_pred_programs,
+                'eop_output_logits': b_z_eop_output_logits,
+                'pred_program_masks': b_z_pred_program_masks,
+                'action_logits': b_z_action_logits,
+                'action_masks': b_z_action_masks,
+                'pre_tanh': pre_tanh_b_z,
+                'z': b_z,
+                'z_mu': b_z_mu,
+            }
+
+            return z_output, b_z_output, encoder_time, decoder_time
 
         # output, z = self.vae(programs, program_masks, self.teacher_enforcing)
         """ VAE forward pass """
@@ -820,11 +2039,12 @@ class ProgramVAE(nn.Module):
         t = time.time()
         if self.vae._use_transformer_encoder:
             program_masks = program_masks.squeeze().unsqueeze(-2)
-            _, h_enc = self.vae.encoder(programs, program_masks)
+            _, h_enc = self.vae.program_encoder(programs, program_masks)
         else:
-            _, h_enc = self.vae.encoder(programs, program_lens)
+            _, h_enc = self.vae.program_encoder(programs, program_lens)
         encoder_time = time.time() - t
         z = h_enc.squeeze() if self.vae._vanilla_ae else self.vae._sample_latent(h_enc.squeeze())
+        #print(f"z.shape: {z.shape}")
         pre_tanh_value = None
         if self._tanh_after_sample or not self.use_decoder_dist:
             pre_tanh_value = z
@@ -883,15 +2103,15 @@ class ProgramVAE(nn.Module):
                 else:
                     assert (act_program_info == debug_input[key][i]).all()
 
-    def act(self, programs, rnn_hxs, masks, init_states, deterministic=False):
+    def act(self, programs, rnn_hxs, masks, s_h, deterministic=False):
         program_masks = programs != self.num_program_tokens-1
-        outputs = self(programs.long(), program_masks, init_states, None, rnn_hxs, masks, deterministic=deterministic,
+        outputs = self(programs.long(), program_masks, s_h, None, rnn_hxs, masks, deterministic=deterministic,
                        evaluate=False)
         return outputs
 
-    def get_value(self, programs, rnn_hxs, masks, init_states, deterministic=False):
+    def get_value(self, programs, rnn_hxs, masks, s_h, deterministic=False):
         program_masks = programs != self.num_program_tokens-1
-        outputs = self(programs.long(), program_masks, init_states, None, rnn_hxs, masks, deterministic=deterministic,
+        outputs = self(programs.long(), program_masks, s_h, None, rnn_hxs, masks, deterministic=deterministic,
                        evaluate=False)
 
         value, pred_programs, pred_programs_log_probs, z, pred_program_masks, eop_pred_programs, \
@@ -901,7 +2121,7 @@ class ProgramVAE(nn.Module):
 
     def evaluate_actions(self, inputs, rnn_hxs, masks, action, output_mask_all, eop_action, agent_actions,
                          agent_action_masks, program_ids, deterministic=False):
-        programs, init_states, z = inputs
+        programs, s_h, z = inputs
         program_masks = programs != self.num_program_tokens - 1
 
         if self._debug:
@@ -911,7 +2131,7 @@ class ProgramVAE(nn.Module):
                                      'agent_action_masks': agent_action_masks,
                                      'ids': program_ids})
 
-        outputs = self(programs.long(), program_masks, init_states, None, rnn_hxs=rnn_hxs, masks=masks,
+        outputs = self(programs.long(), program_masks, s_h, None, rnn_hxs=rnn_hxs, masks=masks,
                        action=action.long(), output_mask_all=output_mask_all, eop_action=eop_action,
                        agent_actions=agent_actions, agent_action_masks=agent_action_masks,
                        deterministic=deterministic, evaluate=True)

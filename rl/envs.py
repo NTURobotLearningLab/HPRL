@@ -48,7 +48,7 @@ def make_env(env_id, seed, rank, log_dir, allow_early_resets, custom_env=False, 
         if is_atari:
             env = make_atari(env_id)
 
-        env.seed(seed + rank)
+        env.reset(seed = seed + rank)
 
         obs_shape = env.observation_space.shape
 
@@ -89,7 +89,7 @@ def make_env(env_id, seed, rank, log_dir, allow_early_resets, custom_env=False, 
         env._max_episode_steps = custom_kwargs['config'].max_episode_steps
 
         # set seed
-        env.seed(seed + rank)
+        env.reset(seed = seed + rank)
 
         # log dir
         if log_dir is not None:
@@ -113,7 +113,7 @@ def make_env(env_id, seed, rank, log_dir, allow_early_resets, custom_env=False, 
         env._max_episode_steps = custom_kwargs['config'].max_episode_steps
 
         # set seed
-        env.seed(seed + rank)
+        env.reset(seed = seed + rank)
 
         if log_dir is not None:
             env = bench.Monitor(
